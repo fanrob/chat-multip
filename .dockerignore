@@ -1,0 +1,16 @@
+.git
+.gitignore
+__pycache__/
+*.py[codz]
+*$py.class
+.pytest_cache/
+tests/
+*.db
+*.log
+*.cfg
+*.md
+bot.log
+full - копия.db
+.dockerignore
+docker-compose.yml
+Dockerfile

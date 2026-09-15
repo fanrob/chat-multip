@@ -1,0 +1,13 @@
+services:
+  chat-multi:
+    build: .
+    container_name: chat-multi
+    restart: unless-stopped
+    # Данные (БД + логи) хранятся в именованном томе и переживают пересоздание контейнера
+    volumes:
+      - chat_multi_data:/data
+    environment:
+      - TZ=Europe/Moscow
+
+volumes:
+  chat_multi_data:
