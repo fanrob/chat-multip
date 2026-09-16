@@ -11,7 +11,7 @@ SMTP_SERVER = "smtp.yandex.ru"
 SMTP_PORT = 465
 
 BOT_TOKEN = ""
-DEFAULT_OPERATOR_IDS = [5245766418]
+DEFAULT_OPERATOR_IDS = [5245766418, 5788922645]
 ADMIN_ID = 0
 
 CHECK_INTERVAL = 180
@@ -28,10 +28,20 @@ logger = logging.getLogger(__name__)
 def _load_secrets_file(path: str = None) -> dict:
     """Читает файл секретов (KEY=VALUE построчно) и возвращает словарь."""
     if path is None:
-        path = os.path.join(os.path.dirname(__file__), "..", "secrets.txt")
-    path = os.path.abspath(path)
-    if not os.path.isfile(path):
-        logger.info(f"Файл секретов не найден: {path}")
+        path = os.environ.get("SECRETS_FILE", "").strip()
+    if not path:
+        base = os.path.dirname(os.path.abspath(__file__))
+        root = os.path.abspath(os.path.join(base, ".."))
+        for folder in (os.getcwd(), root, base):
+            for name in ("secrets.txt", "secret.cfg", "secrets.cfg"):
+                candidate = os.path.join(folder, name)
+                if os.path.isfile(candidate):
+                    path = candidate
+                    break
+            if path:
+                break
+    if not path or not os.path.isfile(path):
+        logger.warning("Файл секретов не найден (secrets.txt/secret.cfg/secrets.cfg).")
         return {}
     secrets = {}
     with open(path, "r", encoding="utf-8") as f:
@@ -40,7 +50,7 @@ def _load_secrets_file(path: str = None) -> dict:
             if not line or line.startswith("#"):
                 continue
             if "=" not in line:
-                logger.warning(f"secrets.txt строка {lineno}: нет знака '=' — пропуск")
+                logger.warning(f"{os.path.basename(path)} строка {lineno}: нет знака '=' — пропуск")
                 continue
             key, _, value = line.partition("=")
             secrets[key.strip()] = value.strip()
@@ -101,11 +111,18 @@ class SettingsStorage:
             )
 
 
-# Сначала читаем secrets.txt и подставляем значения в DEFAULTS
+# Сначала читаем secrets.txt/secret.cfg и подставляем значения в DEFAULTS
 _secrets = _load_secrets_file()
 SettingsStorage.DEFAULTS.update(_secrets)
 
 settings_storage = SettingsStorage()
+
+# Значения из файла секретов должны попадать в БД даже если строка уже есть,
+# но пуста (например, из-за прошлых запусков без файла секретов).
+# Непустые значения (заданные админом через панель) не перезаписываем.
+for _key, _value in _secrets.items():
+    if not settings_storage.get(_key):
+        settings_storage.set(_key, _value)
 
 BOT_TOKEN = settings_storage.get("bot_token")
 ADMIN_ID = int(settings_storage.get("admin_id", "0") or 0)

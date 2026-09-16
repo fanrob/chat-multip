@@ -6,6 +6,9 @@ services:
     # Данные (БД + логи) хранятся в именованном томе и переживают пересоздание контейнера
     volumes:
       - chat_multi_data:/data
+      # Файл секретов: создайте ./secret.cfg рядом с docker-compose.yml
+      # (см. secrets.txt.example — формат KEY=VALUE, ключи bot_token, admin_id, email, email_password)
+      - ./secret.cfg:/data/secret.cfg:ro
     environment:
       - TZ=Europe/Moscow
 
