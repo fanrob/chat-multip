@@ -1,13 +1,69 @@
 services:
+  # HTTP API для клиента Viber/Desktop. Живёт отдельным процессом: uvicorn и
+  # telegram-бот несовместимы в одном процессе (оба хотят свой asyncio-цикл).
+  api:
+    build: .
+    container_name: chat-multi-api
+    restart: unless-stopped
+    command: ["python", "/app/src/api/app.py"]
+    # Публикуем наружу: клиент ходит сюда, а не в контейнер бота.
+    ports:
+      - "21000:21000"
+    volumes:
+      # Тот же том, что у бота: общие full.db и каталог вложений.
+      - chat_multi_data:/data
+      - ./secret.cfg:/data/secret.cfg:ro
+    environment:
+      - TZ=Europe/Moscow
+      - CHAT_MULTI_DB=/data/full.db
+      - CHAT_MULTI_ATTACHMENTS=/data/attachments
+      - CHAT_MULTI_API_HOST=0.0.0.0
+      - CHAT_MULTI_API_PORT=21000
+      - CHAT_MULTI_LOG_LEVEL=INFO
+    healthcheck:
+      # healthcheck идёт после миграций: без них бот не найдёт api_outbox.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:21000/v1/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   chat-multi:
     build: .
     container_name: chat-multi
     restart: unless-stopped
+    # Бот стартует после API: тот накладывает миграции, а консьюмер очереди
+    # отправки работает уже по готовой схеме.
+    depends_on:
+      api:
+        condition: service_healthy
     # Данные (БД + логи) хранятся в именованном томе и переживают пересоздание контейнера
     volumes:
       - chat_multi_data:/data
       # Файл секретов: создайте ./secret.cfg рядом с docker-compose.yml
       # (см. secrets.txt.example — формат KEY=VALUE, ключи bot_token, admin_id, email, email_password)
+      - ./secret.cfg:/data/secret.cfg:ro
+    environment:
+      - TZ=Europe/Moscow
+
+  # Почтовый бот: чтение IMAP и отправка ответов клиентам по SMTP. Отдельный
+  # процесс от Telegram-бота, общий том данных и тот же секрет с почтовым паролем.
+  mail-bot:
+    build: .
+    container_name: chat-multi-mail
+    restart: unless-stopped
+    command: ["python", "/app/src/mail_bot/main.py"]
+    # Стартует после API по той же причине, что и чат-бот: нужна готовая схема
+    # api_outbox и настроенный каталог вложений.
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - chat_multi_data:/data
       - ./secret.cfg:/data/secret.cfg:ro
     environment:
       - TZ=Europe/Moscow

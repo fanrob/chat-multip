@@ -5,7 +5,6 @@ from typing import Optional
 
 from config import FULL_DB, DEFAULT_OPERATOR_IDS
 from models import Ticket
-from email_utils import normalize_email_subject
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +26,6 @@ class TicketStorage:
                     created_at TEXT NOT NULL,
                     message_id TEXT,
                     subject TEXT NOT NULL DEFAULT '',
-                    close_prompted_at TEXT,
-                    close_prompt_message_id INTEGER,
-                    close_no_at TEXT,
                     workshop_id INTEGER
                 )
                 """
@@ -41,7 +37,8 @@ class TicketStorage:
         return {row[0] for row in rows if row[0]}
 
     @staticmethod
-    def _from_row(row: sqlite3.Row) -> Ticket:
+    def from_row(row: sqlite3.Row) -> Ticket:
+        """Заявка из строки таблицы. Нужен и хранилищу, и поиску по теме в mail_bot."""
         return Ticket(
             id=row['id'],
             source=row['source'],
@@ -53,9 +50,6 @@ class TicketStorage:
             created_at=datetime.fromisoformat(row['created_at']),
             message_id=row['message_id'],
             subject=row['subject'],
-            close_prompted_at=row['close_prompted_at'],
-            close_prompt_message_id=row['close_prompt_message_id'],
-            close_no_at=row['close_no_at'],
             workshop_id=row['workshop_id'],
         )
 
@@ -64,8 +58,8 @@ class TicketStorage:
             connection.execute(
                 """
                 INSERT INTO tickets
-                    (id, source, client_id, client_name, text, status, taken_by, created_at, message_id, subject, close_prompted_at, close_prompt_message_id, close_no_at, workshop_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, source, client_id, client_name, text, status, taken_by, created_at, message_id, subject, workshop_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     source = excluded.source,
                     client_id = excluded.client_id,
@@ -76,15 +70,11 @@ class TicketStorage:
                     created_at = excluded.created_at,
                     message_id = excluded.message_id,
                     subject = excluded.subject,
-                    close_prompted_at = excluded.close_prompted_at,
-                    close_prompt_message_id = excluded.close_prompt_message_id,
-                    close_no_at = excluded.close_no_at,
                     workshop_id = excluded.workshop_id
                 """,
                 (ticket.id, ticket.source, ticket.client_id, ticket.client_name,
                  ticket.text, ticket.status, ticket.taken_by, ticket.created_at.isoformat(),
-                 ticket.message_id, ticket.subject, ticket.close_prompted_at,
-                 ticket.close_prompt_message_id, ticket.close_no_at, ticket.workshop_id),
+                 ticket.message_id, ticket.subject, ticket.workshop_id),
             )
 
 
@@ -94,7 +84,7 @@ class TicketStorage:
             row = connection.execute(
                 "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
             ).fetchone()
-        return self._from_row(row) if row else None
+        return self.from_row(row) if row else None
 
     def update(self, ticket: Ticket):
         self.add(ticket)
@@ -106,105 +96,18 @@ class TicketStorage:
                 "SELECT * FROM tickets WHERE client_id = ? AND status IN ('new', 'taken') ORDER BY created_at DESC LIMIT 1",
                 (client_id,)
             ).fetchone()
-        return self._from_row(row) if row else None
-
-    def get_operator_tickets(self, operator_id: int) -> list[Ticket]:
-        """Получает все активные (взятые в работу) заявки мастера."""
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT * FROM tickets WHERE taken_by = ? AND status IN ('new', 'taken') ORDER BY created_at DESC",
-                (operator_id,)
-            ).fetchall()
-        return [self._from_row(row) for row in rows]
-
-    def get_operator_all_tickets(self, operator_id: int, limit: int = 20) -> list[Ticket]:
-        """Все заявки мастера для выбора: сначала открытые, затем недавно закрытые."""
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT * FROM tickets WHERE taken_by = ? "
-                "ORDER BY (status IN ('new', 'taken')) DESC, created_at DESC LIMIT ?",
-                (operator_id, limit)
-            ).fetchall()
-        return [self._from_row(row) for row in rows]
-
-    def get_open_ticket_by_id(self, ticket_id: str) -> Optional[Ticket]:
-        ticket = self.get(ticket_id)
-        if ticket and ticket.status in {'new', 'taken'}:
-            return ticket
-        return None
-
-    def get_open_email_ticket_by_subject(self, subject: str) -> Optional[Ticket]:
-        normalized_subject = normalize_email_subject(subject)
-        if not normalized_subject:
-            return None
-
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT * FROM tickets WHERE source = 'email' "
-                "AND status IN ('new', 'taken') ORDER BY created_at DESC"
-            ).fetchall()
-        for row in rows:
-            if normalize_email_subject(row['subject']) == normalized_subject:
-                return self._from_row(row)
-        return None
-
-    def get_ticket_by_message_id(self, message_id: int) -> Optional[Ticket]:
-        """Получает заявку по ID сообщения мастера."""
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            row = connection.execute(
-                "SELECT t.* FROM tickets t "
-                "INNER JOIN operator_messages om ON t.id = om.ticket_id "
-                "WHERE om.message_id = ?",
-                (message_id,)
-            ).fetchone()
-        return self._from_row(row) if row else None
-
-    def get_active_tickets(self) -> list[Ticket]:
-        """Возвращает все открытые заявки (статус new или taken)."""
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT * FROM tickets WHERE status IN ('new', 'taken') ORDER BY created_at"
-            ).fetchall()
-        return [self._from_row(row) for row in rows]
-
-    def get_last_activity_time(self, ticket_id: str) -> Optional[datetime]:
-        """Возвращает время последнего сообщения в диалоге по заявке.
-
-        Учитываются и создание заявки, и все сообщения (мастеров и клиентов),
-        и последнее нажатие «Нет» (перезапускает отсчёт 14 дней).
-        """
-        with sqlite3.connect(self.db_path) as connection:
-            row = connection.execute(
-                """
-                SELECT MAX(ts) AS last_ts FROM (
-                    SELECT created_at AS ts FROM tickets WHERE id = ?
-                    UNION ALL
-                    SELECT sent_at AS ts FROM operator_messages WHERE ticket_id = ?
-                    UNION ALL
-                    SELECT close_no_at AS ts FROM tickets WHERE id = ? AND close_no_at IS NOT NULL
-                )
-                """,
-                (ticket_id, ticket_id, ticket_id)
-            ).fetchone()
-        raw = row[0] if row else None
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(raw)
-        except ValueError:
-            return None
+        return self.from_row(row) if row else None
 
 
 ticket_storage = TicketStorage()
 
 
 class OperatorMessageStorage:
-    """Отслеживание сообщений мастеров для определения заявки при ответе."""
+    """Привязка сообщений Telegram к заявкам.
+
+    Ключ — message_id отправленного клиенту сообщения: по реплаю на него бот
+    понимает, в какую заявку попадёт ответ клиента.
+    """
 
     def __init__(self, db_path: str = FULL_DB):
         self.db_path = db_path
@@ -238,48 +141,6 @@ class OperatorMessageStorage:
                  sender, sender_id, text),
             )
 
-    def get_ticket_dialog(self, ticket: Ticket) -> list[dict]:
-        """Возвращает переписку по заявке: [{'role','author','time','text'}, ...].
-
-        Первое сообщение — текст самой заявки (от клиента).
-        Дальше — сохранённые сообщения клиента и мастера (sender='client'/'op').
-        """
-        dialog = [{
-            'role': 'client',
-            'author': ticket.client_name,
-            'time': ticket.created_at,
-            'text': ticket.text,
-        }]
-        name_map = {}
-        for row in master_storage.all(include_deleted=True):
-            name_map[str(row['user_id'])] = row['full_name'] or str(row['user_id'])
-
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT sender, sender_id, text, sent_at FROM operator_messages "
-                "WHERE ticket_id = ? AND sender IN ('op', 'client') AND text != '' "
-                "ORDER BY sent_at, message_id",
-                (ticket.id,)
-            ).fetchall()
-
-        for row in rows:
-            role = row['sender']
-            if role == 'op':
-                author = name_map.get(str(row['sender_id']), f"Мастер {row['sender_id']}")
-            else:
-                author = ticket.client_name
-            try:
-                time = datetime.fromisoformat(row['sent_at'])
-            except (ValueError, TypeError):
-                time = ticket.created_at
-            dialog.append({
-                'role': role,
-                'author': author,
-                'time': time,
-                'text': row['text'],
-            })
-        return dialog
 
     def get_ticket_id(self, message_id: int) -> Optional[str]:
         with sqlite3.connect(self.db_path) as connection:
@@ -289,35 +150,12 @@ class OperatorMessageStorage:
             ).fetchone()
         return row[0] if row else None
 
-    def get_last_ticket_id(self, operator_id: int) -> Optional[str]:
-        with sqlite3.connect(self.db_path) as connection:
-            row = connection.execute(
-                "SELECT ticket_id FROM operator_messages WHERE operator_id = ? ORDER BY sent_at DESC LIMIT 1",
-                (operator_id,)
-            ).fetchone()
-        return row[0] if row else None
-
-    def get_last_open_ticket_id(self, operator_id: int) -> Optional[str]:
-        """ Получает ID последней открытой заявки для заданного мастера """
-        with sqlite3.connect(self.db_path) as connection:
-            row = connection.execute(
-                """
-                SELECT om.ticket_id
-                FROM operator_messages om
-                INNER JOIN tickets t ON t.id = om.ticket_id
-                WHERE om.operator_id = ? AND t.status = 'taken'
-                ORDER BY om.sent_at DESC LIMIT 1
-                """,
-                (operator_id,)
-            ).fetchone()
-        return row[0] if row else None
-
 
 operator_message_storage = OperatorMessageStorage()
 
 
 class MasterStorage:
-    """Хранение мастеров в БД с поддержкой мягкого удаления и цехов."""
+    """Реестр мастеров и цехов (админские данные, общие для бота и API)."""
 
     def __init__(self, db_path: str = FULL_DB):
         self.db_path = db_path
@@ -396,15 +234,6 @@ class MasterStorage:
         with sqlite3.connect(self.db_path) as connection:
             cursor = connection.execute(
                 "UPDATE masters SET is_deleted = 1 WHERE user_id = ? AND is_deleted = 0",
-                (user_id,)
-            )
-        return cursor.rowcount > 0
-
-    def restore(self, user_id: int) -> bool:
-        """Восстанавливает удаленного мастера."""
-        with sqlite3.connect(self.db_path) as connection:
-            cursor = connection.execute(
-                "UPDATE masters SET is_deleted = 0 WHERE user_id = ? AND is_deleted = 1",
                 (user_id,)
             )
         return cursor.rowcount > 0

@@ -1,16 +1,38 @@
+#главный модуль телеграм бота
+
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+# Позволяет запускать файл напрямую (`python src/telegram_bot/main.py`), когда
+# каталог src не в PYTHONPATH. Тот же приём, что в api/app.py.
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from functools import partial
 
 from telegram import Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from config import BOT_TOKEN, LOG_FILE
-from mail import periodic_email_check
-from bot import (
-    start, handle_telegram_message, button_callback,
-    close_ticket, admin_panel, admin_callback, get_my_tickets,
-    apply_operator_request, transfer_admin, periodic_inactivity_check,
+from outbox_queue import CHANNEL_TELEGRAM, outbox_loop, recover_stale
+from telegram_bot.bot import (
+    admin_callback,
+    admin_panel,
+    button_callback,
+    handle_telegram_message,
+    start,
+    transfer_admin,
 )
+from telegram_bot.outbox import deliver as deliver_telegram
 
 # Настройка логирования: вывод в консоль + запись в файл с ротацией (5 МБ, 3 резервных копии)
 logging.basicConfig(
@@ -25,21 +47,26 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(app: Application):
-    """Фоновые задачи запускаются после инициализации event loop."""
-    app.create_task(periodic_email_check(app), name="email_check")
-    app.create_task(periodic_inactivity_check(app), name="inactivity_check")
+    """Фоновые задачи запускаются после инициализации event loop.
+
+    Здесь же outbox-консьюмер: он доставляет в Telegram сообщения, отправленные
+    мастерами через API. Ответы по заявкам, пришедшим на почту, доставляет
+    отдельный процесс mail_bot, поэтому консьюмер забирает только свой канал.
+    Запускать его надо после recover_stale(), иначе он первым же запросом
+    увидит строки, застрявшие в sending после прошлого падения, и не тронет их.
+    """
+    recover_stale(CHANNEL_TELEGRAM)
+    app.create_task(
+        outbox_loop(CHANNEL_TELEGRAM, partial(deliver_telegram, app.bot)), name="outbox"
+    )
 
 
 def main():
-    """Главная функция для запуска бота."""
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("close", close_ticket))
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CommandHandler("my_tickets", get_my_tickets))
-    app.add_handler(CommandHandler("apply_operator", apply_operator_request))
-    app.add_handler(CommandHandler("transfer_admin", transfer_admin))
+    app.add_handler(CommandHandler("transfer_admin", transfer_admin))   #TODO переделать алгоритм, чтобы любомы можно было отправить запрос на админство
 
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^(adm_|approve_op_|reject_op_|delete_op_|op_confirm_|transfer_admin_|del_wshop_)'))
 

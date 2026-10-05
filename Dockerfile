@@ -23,4 +23,6 @@ RUN mkdir -p /data \
 WORKDIR /data
 USER appuser
 
-CMD ["python", "/app/src/main.py"]
+# Точка входа чат-бота. Второй процесс из того же образа — почтовый бот:
+#   docker run ... /app/src/mail_bot/main.py
+CMD ["python", "/app/src/telegram_bot/main.py"]

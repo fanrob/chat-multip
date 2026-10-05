@@ -12,13 +12,11 @@ class Ticket:
     client_name: str
     text: str
     status: str = 'new'
+    # Legacy: мастеры больше не работают в Telegram, это поле не заполняется.
     taken_by: Optional[int] = None
     created_at: datetime = None
     message_id: Optional[str] = None
     subject: str = ''
-    close_prompted_at: Optional[str] = None
-    close_prompt_message_id: Optional[int] = None
-    close_no_at: Optional[str] = None
     workshop_id: Optional[int] = None
 
     def __post_init__(self):

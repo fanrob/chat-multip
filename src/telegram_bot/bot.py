@@ -1,65 +1,34 @@
-import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, ContextTypes
+from telegram.ext import ContextTypes
 
-from config import settings_storage, CLOSE_PROMPT_AFTER_DAYS, AUTO_CLOSE_AFTER_DAYS, INACTIVITY_CHECK_INTERVAL
+from config import settings_storage
+from bridge import record_client_message, record_ticket_closed, record_ticket_created
 from models import Ticket, generate_ticket_id
 from storage import (
     ticket_storage, operator_message_storage, master_storage,
     is_operator, get_operator_ids, is_admin, get_admin_id
 )
-from mail import send_email_reply, notify_operators
 
 logger = logging.getLogger(__name__)
-
-ALLOW_FOREIGN_TICKET_REPLIES = "разрешить ответы на чужие заявки"
-
-SETTING_CLOSE_PROMPT_DAYS = "close_prompt_after_days"
-SETTING_AUTO_CLOSE_DAYS = "auto_close_after_days"
-
-
-def get_close_prompt_days() -> int:
-    return int(settings_storage.get(SETTING_CLOSE_PROMPT_DAYS, str(CLOSE_PROMPT_AFTER_DAYS)))
-
-
-def get_auto_close_days() -> int:
-    return int(settings_storage.get(SETTING_AUTO_CLOSE_DAYS, str(AUTO_CLOSE_AFTER_DAYS)))
 
 # Глобальное хранилище заявок на роль мастера: {user_id: user_name}
 operator_requests = {}
 admin_transfer_requests = {}
 
 
-def build_close_button(ticket_id: str, role: str = "client") -> InlineKeyboardMarkup:
-    """Создаёт кнопку закрытия заявки для клиента или мастера."""
-    callback_prefix = "close_client" if role == "client" else "close_op"
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть заявку", callback_data=f"{callback_prefix}_{ticket_id}")]])
-
-
-def build_operator_keyboard() -> ReplyKeyboardMarkup:
-    """Создаёт постоянную клавиатуру для мастера."""
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📋 Мои заявки"), KeyboardButton("❌ Закрыть заявку")],
-         [KeyboardButton("📤 Отправить диалог")]],
-        resize_keyboard=True,
-        one_time_keyboard=False
+def build_close_button(ticket_id: str) -> InlineKeyboardMarkup:
+    """Кнопка закрытия заявки клиентом."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Закрыть заявку", callback_data=f"close_client_{ticket_id}")]]
     )
 
+
 def build_admin_keyboard() -> ReplyKeyboardMarkup:
-    """Создаёт постоянную клавиатуру администратора-мастера."""
+    """Постоянная клавиатура администратора."""
     return ReplyKeyboardMarkup(
-        [
-            [
-                KeyboardButton("📋 Мои заявки"),
-                KeyboardButton("❌ Закрыть заявку"),
-                KeyboardButton("👑 Панель администратора"),
-            ],
-            [KeyboardButton("📤 Отправить диалог")],
-        ],
+        [[KeyboardButton("👑 Панель администратора")]],
         resize_keyboard=True,
         one_time_keyboard=False
     )
@@ -79,18 +48,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветственное сообщение для новых пользователей."""
     if is_admin(update.effective_user.id):
         await update.message.reply_text(
-                    "👋 Привет, администратор! Вы можете принимать заявки от клиентов, управлять мастерами и настройками",
-                    reply_markup=(
-                        build_admin_keyboard()
-                    ),
-                )
+            "👋 Привет, администратор! Заявки клиентов вы получаете в приложении, "
+            "здесь доступны управление мастерами и настройки.",
+            reply_markup=build_admin_keyboard(),
+        )
         return
-    elif is_operator(update.effective_user.id):
+    if is_operator(update.effective_user.id):
         await update.message.reply_text(
-            "👋 Привет, мастер! Вы можете принимать заявки от клиентов.",
-            reply_markup=(
-                build_operator_keyboard()
-            ),
+            "👋 Привет, мастер! Заявки клиентов и ответы им доступны в приложении — "
+            "здесь можно запросить доступ администратора.",
         )
         return
     await update.message.reply_text(
@@ -105,12 +71,6 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     """Обрабатывает сообщения от пользователей (не мастеров)."""
     user = update.effective_user
 
-    # Ожидаем ввод нового значения настроек (количество дней) от администратора
-    awaiting_setting = context.user_data.get('awaiting_days_setting')
-    if awaiting_setting and is_admin(user.id):
-        await process_days_setting_input(update, context, awaiting_setting)
-        return
-
     # Ожидаем ввод названия нового цеха от администратора
     if context.user_data.get('awaiting_workshop_name') and is_admin(user.id):
         await process_workshop_name_input(update, context)
@@ -122,27 +82,24 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         await process_email_setting_input(update, context, awaiting_email_setting)
         return
 
-    if is_operator(user.id) or is_admin(user.id):
-        # Проверяем нажатие на кнопку "Мои заявки"
-        if update.message.text == "📋 Мои заявки":
-            await get_my_tickets(update, context)
-            return
-        if update.message.text == "❌ Закрыть заявку":
-            await show_close_ticket_menu(update, context)
-            return
-        if update.message.text == "📤 Отправить диалог":
-            await show_send_dialog_ticket_menu(update, context)
-            return
-        if is_admin(user.id) and update.message.text == "👥 Список мастеров":
+    if is_admin(user.id):
+        # Админские кнопки; заявки клиентов админ обрабатывает в приложении.
+        if update.message.text == "👥 Список мастеров":
             await show_operator_list(update, context)
             return
-        if is_admin(user.id) and update.message.text == "🗑 Удалить мастера":
+        if update.message.text == "🗑 Удалить мастера":
             await show_delete_operator_menu(update, context)
             return
-        if is_admin(user.id) and update.message.text == "👑 Панель администратора":
+        if update.message.text == "👑 Панель администратора":
             await admin_panel(update, context)
             return
-        await handle_operator_reply(update, context)
+
+    if is_operator(user.id) or is_admin(user.id):
+        # Мастера и админ работают с заявками в приложении, а не в боте.
+        await update.message.reply_text(
+            "ℹ️ Заявки и ответы клиентам доступны в приложении мастера. "
+            "Здесь бот только принимает заявки от клиентов и ведёт админ-настройки."
+        )
         return
 
     replied_ticket_id = None
@@ -152,18 +109,17 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     if replied_ticket_id:
         replied_ticket = ticket_storage.get(replied_ticket_id)
         if replied_ticket:
-            if replied_ticket.taken_by:
-                operator_id = replied_ticket.taken_by
-                reply_text = f"📨 **Сообщение от клиента** (ID заявки: {replied_ticket.id}):\n\n{update.message.text}"
-                try:
-                    sent_message = await context.bot.send_message(chat_id=operator_id, text=reply_text, parse_mode='Markdown')
-                    operator_message_storage.add(sent_message.message_id, operator_id, replied_ticket.id, sender='client', sender_id=str(user.id), text=update.message.text)
-                    await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
-                    return
-                except Exception as e:
-                    logger.error(f"Error sending message to operator {operator_id}: {e}")
-                    await update.message.reply_text(f"❌ Ошибка при отправке сообщения мастеру: {e}")
-                    return
+            # Мастер работает в приложении, в Telegram ему ничего не шлём:
+            # сообщение уходит в заявку через мост и приходит мастеру событием.
+            record_client_message(
+                replied_ticket.id,
+                replied_ticket.client_name or str(user.id),
+                update.message.text,
+                chat_id=user.id,
+                message_id=update.message.message_id,
+            )
+            await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
+            return
 
     open_ticket = ticket_storage.get_open_ticket(user.id)
 
@@ -187,18 +143,16 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if open_ticket:
-        if open_ticket.taken_by:
-            operator_id = open_ticket.taken_by
-            reply_text = f"📨 **Сообщение от клиента** (ID заявки: {open_ticket.id}):\n\n{update.message.text}"
-            try:
-                sent_message = await context.bot.send_message(chat_id=operator_id, text=reply_text, parse_mode='Markdown')
-                operator_message_storage.add(sent_message.message_id, operator_id, open_ticket.id, sender='client', sender_id=str(user.id), text=update.message.text)
-                await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
-            except Exception as e:
-                logger.error(f"Error sending message to operator {operator_id}: {e}")
-                await update.message.reply_text(f"❌ Ошибка при отправке сообщения мастеру: {e}")
-        else:
-            await update.message.reply_text("❗ У вас уже есть открытая заявка. Пожалуйста, дождитесь ответа мастера.")
+        # Уточнение по открытой заявке. Проверять taken_by нельзя: мастер
+        # принимает заявку в приложении и это поле больше не заполняется.
+        record_client_message(
+            open_ticket.id,
+            open_ticket.client_name or str(user.id),
+            update.message.text,
+            chat_id=user.id,
+            message_id=update.message.message_id,
+        )
+        await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
         return
 
     workshop_id = context.user_data.get("ticket_workshop_id")
@@ -220,8 +174,9 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         workshop_id=workshop_id,
     )
     ticket_storage.add(ticket)
+    record_ticket_created(ticket.id)
 
-    close_markup = build_close_button(ticket.id, role="client")
+    close_markup = build_close_button(ticket.id)
     if workshop_id is not None:
         workshop_name = master_storage.get_workshop_name(workshop_id) or "выбранный цех"
         await update.message.reply_text(
@@ -230,34 +185,6 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         )
     else:
         await update.message.reply_text("✅ Ваша заявка принята! Мастера скоро свяжутся с вами.", reply_markup=close_markup)
-    await notify_operators(context.bot, ticket)
-
-
-async def process_days_setting_input(update: Update, context: ContextTypes.DEFAULT_TYPE, setting_key: str):
-    """Принимает введённое администратором число дней и сохраняет настройку."""
-    text = (update.message.text or "").strip()
-    try:
-        value = int(text)
-    except ValueError:
-        await update.message.reply_text("❌ Введите число (количество дней).")
-        return
-    if value < 1 or value > 365:
-        await update.message.reply_text("❌ Число дней должно быть от 1 до 365.")
-        return
-
-    settings_storage.set(setting_key, str(value))
-    context.user_data.pop('awaiting_days_setting', None)
-    context.user_data.pop('awaiting_message_id', None)
-
-    label = (
-        "предложение закрыть заявку" if setting_key == SETTING_CLOSE_PROMPT_DAYS
-        else "автозакрытие заявки"
-    )
-    await update.message.reply_text(
-        f"✅ Настройка «{label}» обновлена: теперь **{value} дн.**",
-        parse_mode='Markdown',
-        reply_markup=build_admin_panel_keyboard(),
-    )
 
 
 async def process_workshop_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,118 +253,16 @@ async def process_email_setting_input(update: Update, context: ContextTypes.DEFA
     )
 
 
-async def handle_operator_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ответы мастеров с поддержкой нескольких одновременных заявок."""
-    operator_id = update.effective_user.id
-    ticket = None
-    ticket_id = None
-
-    if update.message.reply_to_message:
-        replied_message_id = update.message.reply_to_message.message_id
-        ticket_id = operator_message_storage.get_ticket_id(replied_message_id)
-        if ticket_id:
-            ticket = ticket_storage.get(ticket_id)
-
-    if not ticket:
-        ticket_id = operator_message_storage.get_last_open_ticket_id(operator_id)
-        if ticket_id:
-            ticket = ticket_storage.get(ticket_id)
-
-    if not ticket:
-        operator_tickets = ticket_storage.get_operator_tickets(operator_id)
-        if not operator_tickets:
-            await update.message.reply_text("❗ У вас нет открытых заявок. Сначала примите заявку или ответьте на сообщение из заявки.")
-            return
-
-        if len(operator_tickets) == 1:
-            ticket = operator_tickets[0]
-        else:
-            lines = ["📋 Выберите заявку для ответа:\n"]
-            for i, t in enumerate(operator_tickets, 1):
-                lines.append(f"{i}. **{t.id}** — {t.client_name}")
-            lines.append("\n_Примечание: ответьте на сообщение о заявке или напишите /close <номер> для закрытия_")
-            await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
-            return
-
-    if not ticket:
-        await update.message.reply_text("❗ Заявка не найдена или закрыта.")
-        return
-
-    if ticket.status == 'closed' and not update.message.reply_to_message:
-        await update.message.reply_text("❗ Эта заявка уже закрыта. Чтобы продолжить её, нажмите «Ответить» на старом сообщении из этой заявки.")
-        return
-
-    replies_allowed = settings_storage.get(
-        ALLOW_FOREIGN_TICKET_REPLIES, "false"
-    ).lower() == "true"
-    if ticket.taken_by != operator_id and not replies_allowed:
-        await update.message.reply_text(
-            "❗ Эта заявка вам не принадлежит. Ответ отправить невозможно."
-        )
-        return
-
-    reply_text = f"📨 **Ответ от мастера** (ID заявки: {ticket.id}):\n\n{update.message.text}"
-    client_id = ticket.client_id
-
-    try:
-        if ticket.source == 'telegram':
-            sent_message = await context.bot.send_message(chat_id=int(client_id), text=reply_text, parse_mode='Markdown')
-            operator_message_storage.add(
-                sent_message.message_id, int(client_id), ticket.id,
-                sender='op', sender_id=str(operator_id), text=update.message.text,
-            )
-        elif ticket.source == 'email':
-            await send_email_reply(
-                ticket.client_id, ticket.id, update.message.text,
-                ticket.message_id, ticket.subject,
-            )
-
-        sent_message = await update.message.reply_text(f"✅ Ваш ответ отправлен клиенту по заявке {ticket.id}.")
-        if ticket.source == 'email':
-            operator_message_storage.add(
-                sent_message.message_id, operator_id, ticket.id,
-                sender='op', sender_id=str(operator_id), text=update.message.text,
-            )
-        else:
-            operator_message_storage.add(sent_message.message_id, operator_id, ticket.id)
-    except Exception as e:
-        logger.error(f"Error sending reply: {e}")
-        await update.message.reply_text(f"❌ Ошибка при отправке ответа: {e}")
-
-
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки (например, 'Принять заявку')."""
+    """Обрабатывает нажатия клиента: закрытие своей заявки.
+
+    Мастерских кнопок больше нет — мастер работает в приложении, а не в боте.
+    """
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     data = query.data or ""
-
-    if data.startswith("close_prompt_yes_") or data.startswith("close_prompt_no_"):
-        answer = "yes" if data.startswith("close_prompt_yes_") else "no"
-        ticket_id = data.replace("close_prompt_yes_", "").replace("close_prompt_no_", "")
-        ticket = ticket_storage.get(ticket_id)
-        if not is_operator(user_id):
-            await query.edit_message_text("⛔ У вас нет прав для выполнения этого действия.")
-            return
-        if not ticket:
-            await query.edit_message_text("❌ Заявка не найдена.")
-            return
-
-        if answer == "yes":
-            await close_ticket_and_notify(context.bot, ticket, by=user_id)
-            await query.edit_message_text(f"✅ Заявка {ticket.id} закрыта.")
-        else:
-            # Начинаем отсчёт заново
-            ticket.close_prompted_at = None
-            ticket.close_prompt_message_id = None
-            ticket.close_no_at = datetime.now().isoformat()
-            ticket_storage.update(ticket)
-            await query.edit_message_text(
-                f"🕒 Заявка {ticket.id} остаётся открытой. "
-                f"Вопрос о закрытии появится снова через {get_close_prompt_days()} дн. неактивности."
-            )
-        return
 
     if data.startswith("close_client_"):
         ticket_id = data.replace("close_client_", "")
@@ -450,448 +275,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ticket.status = 'closed'
         ticket_storage.update(ticket)
-        await query.edit_message_text(f"✅ Заявка {ticket.id} закрыта. Для продолжения напишите сообщение с ответом на прошлое сообщение.")
-        return
-
-    if data.startswith("close_op_"):
-        if not is_operator(user_id):
-            await query.answer("⛔ У вас нет прав для выполнения этого действия.", show_alert=True)
-            return
-        ticket_id = data.replace("close_op_", "")
-        ticket = ticket_storage.get(ticket_id)
-        if not ticket:
-            await query.edit_message_text("❌ Заявка не найдена.")
-            return
-        if ticket.taken_by != user_id:
-            await query.answer("⛔ Вы можете закрыть только свою активную заявку.", show_alert=True)
-            return
-        ticket.status = 'closed'
-        ticket_storage.update(ticket)
-        await query.edit_message_text(f"✅ Заявка {ticket.id} закрыта.")
-        close_notification = f"✅ Заявка **{ticket.id}** закрыта. Спасибо за обращение!"
-        try:
-            if ticket.source == 'telegram':
-                await context.bot.send_message(chat_id=int(ticket.client_id), text=close_notification, parse_mode='Markdown')
-            elif ticket.source == 'email':
-                await send_email_reply(
-                    ticket.client_id, ticket.id,
-                    "Заявка закрыта. Спасибо за обращение!",
-                    ticket.message_id, ticket.subject,
-                )
-        except Exception as e:
-            logger.error(f"Could not notify client about ticket closure: {e}")
-        return
-
-    if not is_operator(user_id):
-        await query.edit_message_text("⛔ У вас нет прав для выполнения этого действия.")
-        return
-
-    if data.startswith("send_dialog_ticket_"):
-        ticket_id = data.replace("send_dialog_ticket_", "")
-        ticket = ticket_storage.get(ticket_id)
-        if not ticket:
-            await query.edit_message_text("❌ Заявка не найдена.")
-            return
-
-        masters = [m for m in master_storage.all() if m['user_id'] != user_id]
-        if not masters:
-            await query.edit_message_text("❗ Нет других мастеров для отправки диалога.")
-            return
-
-        keyboard = [
-            [InlineKeyboardButton(m['full_name'] or str(m['user_id']), callback_data=f"send_dialog_to_{ticket_id}_{m['user_id']}")]
-            for m in masters
-        ]
+        record_ticket_closed(ticket.id)
         await query.edit_message_text(
-            f"🤝 Заявка {ticket.id} ({ticket.client_name}).\nКому отправить диалог?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            f"✅ Заявка {ticket.id} закрыта. Чтобы начать новую — просто напишите текст заявки."
         )
         return
 
-    if data.startswith("send_dialog_to_"):
-        payload = data.replace("send_dialog_to_", "")
-        ticket_id, _, target_str = payload.rpartition("_")
-        target_user_id = int(target_str)
-        ticket = ticket_storage.get(ticket_id)
-        if not ticket:
-            await query.edit_message_text("❌ Заявка не найдена.")
-            return
-        try:
-            chunks = await send_ticket_dialog(context, ticket, target_user_id)
-            await query.edit_message_text(
-                f"✅ Диалог заявки {ticket.id} отправлен мастеру "
-                f"({chunks} сообщ.) и открыт в чате с ним."
-            )
-        except Exception as e:
-            logger.error(f"Error sending dialog: {e}")
-            await query.edit_message_text(f"❌ Ошибка при отправке диалога: {e}")
-        return
-
-    if data.startswith("take_"):
-        ticket_id = data.replace("take_", "")
-        ticket = ticket_storage.get(ticket_id)
-
-        if not ticket:
-            await query.message.reply_text("❌ Заявка не найдена.")
-            return
-
-        if ticket.status == 'taken':
-            await query.message.reply_text(f"⚠️ Заявка уже принята мастером {ticket.taken_by}.")
-            return
-
-        ticket.status = 'taken'
-        ticket.taken_by = user_id
-        ticket_storage.update(ticket)
-
-        confirmation_msg = await query.message.reply_text(
-            text=f"✅ Вы приняли заявку {ticket.id}.\n"
-                 f"👤 Клиент: {ticket.client_name}\n"
-                 f"📝 Текст: {ticket.text}\n\n"
-                 f"Теперь вы можете отвечать на неё, просто отправляя сообщения в этот чат или отвечая на это сообщение.",
-            reply_markup=build_close_button(ticket.id, role="operator")
-        )
-        operator_message_storage.add(confirmation_msg.message_id, user_id, ticket_id)
-
-        notification_text = f"👤 мастер {query.from_user.full_name} принял заявку **{ticket.id}**."
-        for op_id in get_operator_ids():
-            if op_id != user_id:
-                try:
-                    await context.bot.send_message(chat_id=op_id, text=notification_text, parse_mode='Markdown')
-                except Exception as e:
-                    logger.error(f"Could not notify operator {op_id}: {e}")
-
-
-async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для закрытия заявки. Использование: /close [ticket_id]"""
-    user_id = update.effective_user.id
-    if not is_operator(user_id):
-        await update.message.reply_text("⛔ У вас нет прав.")
-        return
-
-    ticket_id = None
-
-    if context.args:
-        ticket_id = context.args[0]
-    else:
-        ticket_id = operator_message_storage.get_last_open_ticket_id(user_id)
-
-    active_tickets = ticket_storage.get_operator_tickets(user_id)
-    if not ticket_id and len(active_tickets) > 1:
-        keyboard = [[InlineKeyboardButton(f"{t.id} — {t.client_name}", callback_data=f"close_op_{t.id}")] for t in active_tickets]
-        await update.message.reply_text("📋 Выберите заявку, которую нужно закрыть:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if not ticket_id:
-        await update.message.reply_text("❗ У вас нет открытых заявок. Сначала примите заявку или выберите активную заявку для закрытия.")
-        return
-
-    ticket = ticket_storage.get(ticket_id)
-    if not ticket:
-        await update.message.reply_text("❌ Заявка не найдена.")
-        return
-
-    if ticket.taken_by != user_id:
-        await update.message.reply_text("⛔ Вы не можете закрыть заявку, которая не принята вами.")
-        return
-
-    ticket.status = 'closed'
-    ticket_storage.update(ticket)
-    await update.message.reply_text(f"✅ Заявка {ticket.id} закрыта.")
-
-    close_notification = f"✅ Заявка **{ticket.id}** закрыта. Спасибо за обращение!"
-    try:
-        if ticket.source == 'telegram':
-            await context.bot.send_message(chat_id=int(ticket.client_id), text=close_notification, parse_mode='Markdown')
-        elif ticket.source == 'email':
-            await send_email_reply(
-                ticket.client_id, ticket.id,
-                "Заявка закрыта. Спасибо за обращение!",
-                ticket.message_id, ticket.subject,
-            )
-    except Exception as e:
-        logger.error(f"Could not notify client about ticket closure: {e}")
-
-
-async def show_close_ticket_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает мастеру список его открытых заявок для закрытия."""
-    user_id = update.effective_user.id
-    if not is_operator(user_id):
-        await update.message.reply_text("⛔ У вас нет прав.")
-        return
-
-    active_tickets = ticket_storage.get_operator_tickets(user_id)
-    if not active_tickets:
-        await update.message.reply_text("❗ У вас нет открытых заявок.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton(f"{ticket.id} — {ticket.client_name}", callback_data=f"close_op_{ticket.id}")]
-        for ticket in active_tickets
-    ]
-    await update.message.reply_text(
-        "📋 Выберите заявку, которую нужно закрыть:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-async def get_my_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /mytickets — выводит список заявок, принятых мастером."""
-    user_id = update.effective_user.id
-    if not is_operator(user_id):
-        await update.message.reply_text("⛔ У вас нет прав.")
-        return
-
-    tickets = ticket_storage.get_operator_tickets(user_id)
-    if not tickets:
-        await update.message.reply_text("📭 У вас нет открытых заявок.")
-        return
-
-    lines = ["📋 Ваши открытые заявки:"]
-    for t in tickets:
-        lines.append(f"• **{t.id}** — {t.client_name} (Статус: {t.status})")
-    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
-
-
-# ==================== ОТПРАВКА ДИАЛОГА ====================
-
-MAX_MESSAGE_CHARS = 4000
-
-
-def split_long_text(text: str, limit: int = MAX_MESSAGE_CHARS) -> list[str]:
-    """Разбивает длинный текст на части не длиннее limit (по возможности на границе слов)."""
-    text = text.strip()
-    if len(text) <= limit:
-        return [text]
-
-    parts = []
-    while len(text) > limit:
-        cut = text.rfind(' ', 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        parts.append(text[:cut].strip())
-        text = text[cut:].strip()
-    if text:
-        parts.append(text)
-    return parts
-
-
-def format_ticket_dialog(ticket, dialog) -> list[str]:
-    """Форматирует переписку в один/несколько красивых сообщений (до 4000 символов каждое)."""
-    header = (
-        f"📋 **Диалог по заявке {ticket.id}**\n"
-        f"👤 Клиент: {ticket.client_name}\n"
-        f"📬 Источник: {ticket.source}\n"
-        f"📅 Заявка создана: {ticket.created_at.strftime('%d.%m.%Y %H:%M')}\n"
-        f"{'─' * 30}\n"
-    )
-
-    blocks = []
-    for i, entry in enumerate(dialog):
-        role = "🧑 Клиент" if entry['role'] == 'client' else "🛠 Мастер"
-        author = entry['author']
-        time = entry['time']
-        if isinstance(time, str):
-            try:
-                time = datetime.fromisoformat(time)
-            except ValueError:
-                time = None
-        time_str = time.strftime('%d.%m.%Y %H:%M') if time else "—"
-        text = entry['text'] or ""
-        blocks.append(f"**{i + 1}. {role}: {author}**\n🕐 {time_str}\n{text}")
-
-    header_budget = MAX_MESSAGE_CHARS - len(header)
-    chunks = []
-    current = ""
-    for block in blocks:
-        if len(current) + len(block) + 1 > header_budget and current:
-            chunks.append(current)
-            current = ""
-        if len(block) > header_budget:
-            for part in split_long_text(block, header_budget):
-                if len(current) + len(part) + 1 > header_budget and current:
-                    chunks.append(current)
-                    current = ""
-                current = f"{current}\n{part}" if current else part
-            continue
-        current = f"{current}\n{block}" if current else block
-
-    if current:
-        chunks.append(current)
-
-    if not chunks:
-        chunks = ["(нет сообщений)"]
-
-    result = [f"{header}{chunks[0]}"]
-    for chunk in chunks[1:]:
-        result.append(f"_(продолжение диалога по заявке {ticket.id})_\n\n{chunk}")
-    return result
-
-
-async def show_send_dialog_ticket_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Первый шаг: оператор выбирает заявку, диалог которой хочет отправить."""
-    user_id = update.effective_user.id
-    if not is_operator(user_id):
-        await update.message.reply_text("⛔ У вас нет прав.")
-        return
-
-    tickets = ticket_storage.get_operator_all_tickets(user_id)
-    if not tickets:
-        await update.message.reply_text("❗ У вас нет заявок для отправки.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton(f"{ticket.id} — {ticket.client_name} ({'открыта' if ticket.status in ('new', 'taken') else 'закрыта'})", callback_data=f"send_dialog_ticket_{ticket.id}")]
-        for ticket in tickets
-    ]
-    await update.message.reply_text(
-        "📤 Выберите заявку, диалог которой хотите отправить:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def send_ticket_dialog(context: ContextTypes.DEFAULT_TYPE, ticket, target_user_id: int):
-    """Формирует и отправляет весь диалог заявки мастеру target_user_id."""
-    dialog = operator_message_storage.get_ticket_dialog(ticket)
-    chunks = format_ticket_dialog(ticket, dialog)
-    for chunk in chunks:
-        try:
-            await context.bot.send_message(chat_id=target_user_id, text=chunk, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Error sending dialog chunk to {target_user_id}: {e}")
-            await context.bot.send_message(chat_id=target_user_id, text=chunk)
-    return len(chunks)
-
-
-# ==================== КОНТРОЛЬ НЕАКТИВНОСТИ ====================
-
-
-def build_close_prompt_keyboard(ticket_id: str) -> InlineKeyboardMarkup:
-    keyboard = [[
-        InlineKeyboardButton("✅ Да", callback_data=f"close_prompt_yes_{ticket_id}"),
-        InlineKeyboardButton("❌ Нет", callback_data=f"close_prompt_no_{ticket_id}"),
-    ]]
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def prompt_operator_to_close(app, ticket: Ticket):
-    """Отправляет мастеру заявки запрос о закрытии и сохраняет время запроса."""
-    if not ticket.taken_by:
-        return
-    days = get_close_prompt_days()
-    text = (
-        f"🤔 В диалоге по заявке **{ticket.id}** ({ticket.client_name}) "
-        f"не было сообщений уже {days} дн.\n"
-        f"Закрыть заявку?"
-    )
-    try:
-        sent_message = await app.bot.send_message(
-            chat_id=ticket.taken_by,
-            text=text,
-            parse_mode='Markdown',
-            reply_markup=build_close_prompt_keyboard(ticket.id),
-        )
-        ticket.close_prompted_at = datetime.now().isoformat()
-        ticket.close_prompt_message_id = sent_message.message_id
-        ticket_storage.update(ticket)
-        logger.info(f"Запрошено закрытие заявки {ticket.id} у мастера {ticket.taken_by}")
-    except Exception as e:
-        logger.error(f"Не удалось отправить запрос о закрытии заявки {ticket.id}: {e}")
-
-
-async def close_ticket_and_notify(bot, ticket: Ticket, by: Optional[int] = None):
-    """Закрывает заявку и уведомляет клиента."""
-    ticket.status = 'closed'
-    ticket_storage.update(ticket)
-    logger.info(f"Заявка {ticket.id} закрыта автоматически после неактивности")
-    close_notification = f"✅ Заявка **{ticket.id}** закрыта. Спасибо за обращение!"
-    try:
-        if ticket.source == 'telegram':
-            await bot.send_message(chat_id=int(ticket.client_id), text=close_notification, parse_mode='Markdown')
-        elif ticket.source == 'email':
-            await send_email_reply(
-                ticket.client_id, ticket.id,
-                "Заявка закрыта. Спасибо за обращение!",
-                ticket.message_id, ticket.subject,
-            )
-    except Exception as e:
-        logger.error(f"Could not notify client about ticket closure: {e}")
-
-
-async def check_inactive_tickets(app: Application):
-    """Фоновая задача: контроль неактивных заявок.
-
-    - Если в диалоге нет сообщений больше CLOSE_PROMPT_AFTER_DAYS дней —
-      мастеру приходит запрос «Закрыть заявку?».
-    - Если на запрос не ответили за AUTO_CLOSE_AFTER_DAYS дней —
-      заявка закрывается автоматически.
-    """
-    try:
-        now = datetime.now()
-        prompt_days = get_close_prompt_days()
-        auto_close_days = get_auto_close_days()
-        open_tickets = ticket_storage.get_active_tickets()
-        for ticket in open_tickets:
-            if not ticket.taken_by:
-                continue
-            last_activity = ticket_storage.get_last_activity_time(ticket.id)
-            if last_activity is None:
-                last_activity = ticket.created_at
-
-            prompted_at = None
-            if ticket.close_prompted_at:
-                try:
-                    prompted_at = datetime.fromisoformat(ticket.close_prompted_at)
-                except ValueError:
-                    prompted_at = None
-
-            if prompted_at is None:
-                # Ещё не спрашивали: если нет активности N дней — спрашиваем
-                if (now - last_activity) >= timedelta(days=prompt_days):
-                    await prompt_operator_to_close(app, ticket)
-            else:
-                # Уже спрашивали: если клиент писал после запроса — считаем заново
-                if last_activity > prompted_at:
-                    ticket.close_prompted_at = None
-                    ticket_storage.update(ticket)
-                    continue
-                # Если мастер не нажал кнопку за N дней — закрываем автоматически
-                if (now - prompted_at) >= timedelta(days=auto_close_days):
-                    await close_ticket_and_notify(app.bot, ticket)
-    except Exception as e:
-        logger.error(f"Error checking inactive tickets: {e}")
-
-
-async def periodic_inactivity_check(app: Application):
-    """Запускает бесконечный цикл проверки неактивных заявок."""
-    while True:
-        await check_inactive_tickets(app)
-        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL)
+    await query.edit_message_text("❓ Неизвестная кнопка.")
 
 
 # ==================== АДМИН-ПАНЕЛЬ ====================
 
 
 def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
-    replies_allowed = settings_storage.get(ALLOW_FOREIGN_TICKET_REPLIES, "false").lower() == "true"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📋 Список мастеров", callback_data="adm_ops_list")],
         [InlineKeyboardButton("🗑 Удалить мастера", callback_data="adm_ops_delete")],
         [InlineKeyboardButton("🏭 Добавить цех", callback_data="adm_wshop_add")],
         [InlineKeyboardButton("🏭 Удалить цех", callback_data="adm_wshop_delete")],
-        [InlineKeyboardButton(
-            f"⏳ Предупреждение: {get_close_prompt_days()} дн.",
-            callback_data="adm_ops_days_req_close",
-        )],
-        [InlineKeyboardButton(
-            f"🚫 Автозакрытие: {get_auto_close_days()} дн.",
-            callback_data="adm_ops_days_autoclose",
-        )],
-        [InlineKeyboardButton(
-            "✅ Отвечать на чужие заявки: вкл" if replies_allowed else "❌ Отвечать на чужие заявки: выкл",
-            callback_data="adm_foreign_replies_status",
-        )],
-        [InlineKeyboardButton("Включить ответы на чужие заявки", callback_data="adm_foreign_replies_on")],
-        [InlineKeyboardButton("Отключить ответы на чужие заявки", callback_data="adm_foreign_replies_off")],
-        [InlineKeyboardButton("⚙️ Дополнительные настройки", callback_data="adm_extra_settings")],
+        [InlineKeyboardButton("⚙️ Настройки почты", callback_data="adm_extra_settings")],
     ])
 
 
@@ -905,7 +307,7 @@ def build_extra_settings_keyboard() -> InlineKeyboardMarkup:
             callback_data="adm_extra_email",
         )],
         [InlineKeyboardButton(
-            f"🔑 Пароль почты{f': ••••••••' if has_password else ''}",
+            f"🔑 Пароль почты{': ••••••••' if has_password else ''}",
             callback_data="adm_extra_email_password",
         )],
         [InlineKeyboardButton(
@@ -1033,8 +435,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=applicant_id,
                 text="✅ Поздравляем! Вы добавлены как мастер.\n\n"
-                     "Теперь вы можете принимать заявки от клиентов.",
-                reply_markup=build_operator_keyboard()
+                     "Заявки клиентов и ответы им доступны в приложении мастера.",
             )
         except Exception as e:
             logger.error(f"Could not notify new operator {applicant_id}: {e}")
@@ -1083,8 +484,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=previous_admin_id,
-                    text="ℹ️ Вы больше не являетесь администратором.",
-                    reply_markup=build_operator_keyboard(),
+                    text="ℹ️ Вы больше не являетесь администратором.\n"
+                         "Заявки клиентов доступны в приложении мастера.",
                 )
                 await context.bot.send_message(
                     chat_id=request["target_id"],
@@ -1097,27 +498,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"❌ Запрос пользователя {request['target_name']} отклонён."
             )
-        return
-
-    if data in {"adm_foreign_replies_on", "adm_foreign_replies_off"}:
-        if not is_admin(query.from_user.id):
-            return
-        value = "true" if data.endswith("_on") else "false"
-        settings_storage.set(ALLOW_FOREIGN_TICKET_REPLIES, value)
-        status = "включены" if value == "true" else "отключены"
-        await query.edit_message_text(
-            f"✅ Ответы на чужие заявки {status}.",
-            reply_markup=build_admin_panel_keyboard(),
-        )
-        return
-
-    if data == "adm_foreign_replies_status":
-        if not is_admin(query.from_user.id):
-            return
-        await query.edit_message_text(
-            "Настройка отображается на кнопке ниже.",
-            reply_markup=build_admin_panel_keyboard(),
-        )
         return
 
     if not is_admin(query.from_user.id):
@@ -1231,30 +611,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text("❌ Ошибка при удалении мастера.", reply_markup=build_admin_panel_keyboard())
-        return
-
-    elif data == "adm_ops_days_req_close":
-        if not is_admin(query.from_user.id):
-            return
-        await query.edit_message_text(
-            f"Текущее значение: **{get_close_prompt_days()} дн.**\n\n"
-            f"Введите новое количество дней до предложения закрыть заявку:",
-            parse_mode='Markdown',
-        )
-        context.user_data['awaiting_days_setting'] = SETTING_CLOSE_PROMPT_DAYS
-        context.user_data['awaiting_message_id'] = query.message.message_id
-        return
-
-    elif data == "adm_ops_days_autoclose":
-        if not is_admin(query.from_user.id):
-            return
-        await query.edit_message_text(
-            f"Текущее значение: **{get_auto_close_days()} дн.**\n\n"
-            f"Введите новое количество дней до автозакрытия заявки:",
-            parse_mode='Markdown',
-        )
-        context.user_data['awaiting_days_setting'] = SETTING_AUTO_CLOSE_DAYS
-        context.user_data['awaiting_message_id'] = query.message.message_id
         return
 
     elif data == "adm_back":

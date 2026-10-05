@@ -1,2 +1,5 @@
 python-telegram-bot>=20.6,<21
 imap-tools>=1.6
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.9,<1

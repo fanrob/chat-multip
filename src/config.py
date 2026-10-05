@@ -15,10 +15,9 @@ DEFAULT_OPERATOR_IDS = [5245766418, 5788922645]
 ADMIN_ID = 0
 
 CHECK_INTERVAL = 180
-INACTIVITY_CHECK_INTERVAL = 3600
-CLOSE_PROMPT_AFTER_DAYS = 14
-AUTO_CLOSE_AFTER_DAYS = 7
-FULL_DB = "full.db"
+# Тот же путь, что и у API (api.db читает CHAT_MULTI_DB): бот и API обязаны
+# видеть одну базу, иначе заявки и сообщения расходятся по файлам.
+FULL_DB = os.environ.get("CHAT_MULTI_DB", "full.db")
 LOG_FILE = "bot.log"
 # ==================================================
 
@@ -64,7 +63,6 @@ class SettingsStorage:
     DEFAULTS = {
         "bot_token": "",
         "admin_id": "",
-        "разрешить ответы на чужие заявки": "true",
         "email": "",
         "email_password": "",
         "imap_server": IMAP_SERVER,
@@ -72,8 +70,6 @@ class SettingsStorage:
         "smtp_server": SMTP_SERVER,
         "smtp_port": str(SMTP_PORT),
         "check_interval": str(CHECK_INTERVAL),
-        "close_prompt_after_days": str(CLOSE_PROMPT_AFTER_DAYS),
-        "auto_close_after_days": str(AUTO_CLOSE_AFTER_DAYS),
     }
 
     def __init__(self, db_path: str = FULL_DB):
