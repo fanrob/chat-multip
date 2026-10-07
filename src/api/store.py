@@ -4,9 +4,9 @@
 Читает и меняет существующую таблицу `tickets`, которой пользуется телеграм-бот.
 Иначе появились бы две несовместимые ленты: бот видит одни заявки, клиент — другие.
 
-Единственное расхождение — статус. Бот оперирует `new` / `taken`, контракт API
-требует `new` / `in_progress` / `closed`. Здесь это переводится в обе стороны,
-чтобы бот продолжил работать без правок.
+Статусы единые для всех: `new` / `in_progress` / `closed` хранятся в tickets
+как есть (бот создаёт `new`, закрывает в `closed`, API переводит в
+`in_progress`). Никаких перекодировок.
 """
 
 import json
@@ -28,48 +28,17 @@ STATUS_NEW = "new"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_CLOSED = "closed"
 
-#: Статус API -> статус в таблице tickets (её словарь использует бот).
-_TO_DB = {
-    STATUS_NEW: "new",
-    STATUS_IN_PROGRESS: "taken",
-    STATUS_CLOSED: "closed",
-}
-#: Статус в таблице tickets -> статус API.
-_FROM_DB = {"new": STATUS_NEW, "taken": STATUS_IN_PROGRESS, "closed": STATUS_CLOSED}
-
 #: Статусы, при которых заявка видна всем в общей ленте.
 FEED_STATUS = (STATUS_NEW,)
 #: Статусы заявок, к которым мастер имеет отношение.
 ACTIVE_STATUSES = (STATUS_NEW, STATUS_IN_PROGRESS)
 
 
-def to_db_status(api_status: str) -> str:
-    return _TO_DB.get(api_status, "new")
-
-
-def to_api_status(db_status: Optional[str]) -> str:
-    return _FROM_DB.get(db_status or "new", STATUS_NEW)
-
-
 def _now() -> str:
     return datetime.now().isoformat()
 
 
-def _row_to_dict(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
-    return dict(row) if row else {}
-
-
 # ==================== Идентификаторы ====================
-
-
-def new_ticket_id() -> str:
-    """Идентификатор заявки для API.
-
-    Заявки бота — пятизначные числа, клиент же работает со строками `t_...`.
-    Новая схема использует строки, чтобы id не зависел от канала и не конфликтовал
-    с числовыми id бота.
-    """
-    return "t_" + uuid.uuid4().hex[:10]
 
 
 def new_message_id() -> str:
@@ -112,15 +81,6 @@ def workshop_id_to_api(db_workshop_id: Optional[int]) -> Optional[str]:
     return f"w_{db_workshop_id}" if db_workshop_id is not None else None
 
 
-def workshop_name(connection: sqlite3.Connection, db_workshop_id: Optional[int]) -> Optional[str]:
-    if db_workshop_id is None:
-        return None
-    row = connection.execute(
-        "SELECT name FROM workshops WHERE id = ?", (db_workshop_id,)
-    ).fetchone()
-    return row["name"] if row else None
-
-
 # ==================== Мастера ====================
 
 
@@ -135,12 +95,10 @@ def list_masters(
         """
         SELECT m.*, w.name AS workshop_name,
                (SELECT COUNT(*) FROM tickets t
-                 WHERE t.taken_by IS NOT NULL
-                   AND t.status = 'taken'
-                   AND t.taken_by = CAST(m.legacy_user_id AS TEXT)
+                 WHERE t.status = 'in_progress'
+                   AND t.owner_master_uid = m.master_uid
                ) AS active_tickets,
-               (SELECT MAX(last_seen_at) FROM api_masters s
-                 WHERE s.master_uid = m.master_uid) AS seen
+               m.last_seen_at AS seen
         FROM api_masters m
         LEFT JOIN workshops w ON w.id = m.workshop_id
         WHERE m.is_active = 1
@@ -210,25 +168,11 @@ def get_master_brief(master_uid: str) -> Optional[Dict[str, Any]]:
     return _master_to_brief(row) if row else None
 
 
-def get_master_name(connection: sqlite3.Connection, master_uid: Optional[str]) -> str:
-    if not master_uid:
-        return ""
-    row = connection.execute(
-        "SELECT full_name FROM api_masters WHERE master_uid = ?", (master_uid,)
-    ).fetchone()
-    return (row["full_name"] if row else "") or ""
-
-
 def _owner_of(connection: sqlite3.Connection, ticket_id: str) -> Optional[Dict[str, str]]:
-    """Текущий владелец заявки: {id, full_name} или None.
-
-    Если мастер ещё ни разу не открывал приложение (владелец только из
-    бота), отдаём synthetic-id вида legacy_123, чтобы клиент показал
-    «Мастер 123», а не пустое поле.
-    """
+    """Текущий владелец заявки: {id, full_name} или None."""
     row = connection.execute(
         """
-        SELECT t.taken_by, t.owner_master_uid, m.master_uid, m.full_name
+        SELECT t.owner_master_uid, m.master_uid, m.full_name
         FROM tickets t
         LEFT JOIN api_masters m ON m.master_uid = t.owner_master_uid
         WHERE t.id = ?
@@ -239,36 +183,21 @@ def _owner_of(connection: sqlite3.Connection, ticket_id: str) -> Optional[Dict[s
         return None
     if row["owner_master_uid"]:
         return {"id": row["owner_master_uid"], "full_name": row["full_name"] or ""}
-    if row["taken_by"] is not None:
-        return {"id": f"legacy_{row['taken_by']}", "full_name": f"Мастер {row['taken_by']}"}
     return None
 
 
 # ==================== Заявки ====================
 
 
-#: JOIN на владельца заявки.
-#:
-#: taken_by — Telegram ID (INTEGER, им пользуется бот), owner_master_uid —
-#: master_uid мастера из приложения. Владелец ровно один, но в какой колонке
-#: он лежит, зависит от того, кто взял заявку, поэтому условие общее.
+#: JOIN на владельца заявки — мастеру из api_masters по owner_master_uid.
 _OWNER_JOIN = (
-    "LEFT JOIN api_masters o ON o.master_uid = t.owner_master_uid "
-    "   OR (t.owner_master_uid IS NULL AND CAST(o.legacy_user_id AS INTEGER) = t.taken_by)"
+    "LEFT JOIN api_masters o ON o.master_uid = t.owner_master_uid"
 )
 
 
 def _owner_uid_sql(ticket_alias: str = "t") -> str:
-    """Выражение, дающее master_uid владельца (или NULL).
-
-    Сначала новая колонка, потом старая — на случай заявок, взятых ботом
-    до появления owner_master_uid.
-    """
-    return (
-        f"COALESCE({ticket_alias}.owner_master_uid, ("
-        f"  SELECT m.master_uid FROM api_masters m "
-        f"  WHERE CAST(m.legacy_user_id AS INTEGER) = {ticket_alias}.taken_by))"
-    )
+    """Выражение, дающее master_uid владельца заявки (или NULL)."""
+    return f"{ticket_alias}.owner_master_uid"
 
 
 def _ticket_row_sql(master_uid: str, ticket_id: Optional[str] = None) -> str:
@@ -281,7 +210,6 @@ def _ticket_row_sql(master_uid: str, ticket_id: Optional[str] = None) -> str:
         SELECT t.*,
                o.master_uid AS owner_uid,
                o.full_name  AS owner_name,
-               o.workshop_id AS owner_workshop_id,
                w.name       AS workshop_name,
                (SELECT COUNT(*) FROM ticket_members tm WHERE tm.ticket_id = t.id) AS members_count
         FROM tickets t
@@ -316,21 +244,10 @@ def _hydrate_ticket(
         ).fetchone()
         if owner_row:
             owner = _master_to_brief(owner_row, role="owner")
-    elif row["taken_by"] is not None:
-        # Заявку взял мастер, который ещё не заходил через API.
-        owner = {
-            "id": f"legacy_{row['taken_by']}",
-            "full_name": row["owner_name"] or f"Мастер {row['taken_by']}",
-            "workshop_id": workshop_id_to_api(row["owner_workshop_id"]),
-            "workshop_name": None,
-            "online": False,
-            "active_tickets": 0,
-            "role": "owner",
-        }
 
     data: Dict[str, Any] = {
         "id": ticket_id,
-        "status": to_api_status(row["status"]),
+        "status": row["status"],
         "workshop_id": workshop_id_to_api(row["workshop_id"]),
         "workshop_name": row["workshop_name"],
         "subject": row["subject"] or "",
@@ -446,17 +363,17 @@ def is_visible(connection: sqlite3.Connection, ticket_id: str, master_uid: str) 
         return False
 
     ticket = connection.execute(
-        "SELECT status, taken_by FROM tickets WHERE id = ?", (ticket_id,)
+        "SELECT status FROM tickets WHERE id = ?", (ticket_id,)
     ).fetchone()
     if not ticket:
         return False
 
     # Закрытые заявки показываем всем — по ним может понадобиться история.
-    if to_api_status(ticket["status"]) == STATUS_CLOSED:
+    if ticket["status"] == STATUS_CLOSED:
         return True
 
     # Заявку в работе показываем только её участникам (владельцу и подключённым).
-    if to_api_status(ticket["status"]) == STATUS_IN_PROGRESS:
+    if ticket["status"] == STATUS_IN_PROGRESS:
         return is_member(connection, ticket_id, master_uid)
 
     return True
@@ -465,8 +382,8 @@ def is_visible(connection: sqlite3.Connection, ticket_id: str, master_uid: str) 
 def is_member(connection: sqlite3.Connection, ticket_id: str, master_uid: str) -> bool:
     """Участник ли мастер заявки.
 
-    Учитываем три случая: мастер в ticket_members, мастер — владелец по
-    owner_master_uid, мастер — владелец по старому Telegram-признаку taken_by.
+    Два случая: мастер в ticket_members либо мастер — владелец по
+    owner_master_uid.
     """
     row = connection.execute(
         """
@@ -474,17 +391,14 @@ def is_member(connection: sqlite3.Connection, ticket_id: str, master_uid: str) -
             (SELECT COUNT(*) FROM ticket_members tm
               WHERE tm.ticket_id = t.id AND tm.master_uid = ?) AS in_members,
             (SELECT COUNT(*) FROM api_masters m
-              WHERE m.master_uid = ? AND m.master_uid = t.owner_master_uid) AS is_api_owner,
-            (SELECT COUNT(*) FROM api_masters m
-              WHERE m.master_uid = ?
-                AND CAST(m.legacy_user_id AS INTEGER) = t.taken_by) AS is_legacy_owner
+              WHERE m.master_uid = ? AND m.master_uid = t.owner_master_uid) AS is_api_owner
         FROM tickets t WHERE t.id = ?
         """,
-        (master_uid, master_uid, master_uid, ticket_id),
+        (master_uid, master_uid, ticket_id),
     ).fetchone()
     if not row:
         return False
-    return bool(row["in_members"] or row["is_api_owner"] or row["is_legacy_owner"])
+    return bool(row["in_members"] or row["is_api_owner"])
 
 
 def require_member(connection: sqlite3.Connection, ticket_id: str, master_uid: str) -> None:
@@ -497,7 +411,7 @@ def require_open(connection: sqlite3.Connection, ticket_id: str) -> None:
     row = connection.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
     if not row:
         raise errors.ticket_not_found(ticket_id)
-    if to_api_status(row["status"]) == STATUS_CLOSED:
+    if row["status"] == STATUS_CLOSED:
         raise errors.ticket_closed(ticket_id)
 
 
@@ -529,29 +443,25 @@ def list_tickets(
         )
         params.append(master_uid)
     elif scope == "mine":
-        # Мои: мастер в ticket_members либо владелец (новая колонка или старая).
+        # Мои: мастер в ticket_members либо владелец заявки.
         clauses.append(
             "(EXISTS (SELECT 1 FROM ticket_members tm "
             "    WHERE tm.ticket_id = t.id AND tm.master_uid = ?) "
-            " OR t.owner_master_uid = ? "
-            " OR EXISTS (SELECT 1 FROM api_masters m WHERE m.master_uid = ? "
-            "    AND CAST(m.legacy_user_id AS INTEGER) = t.taken_by))"
+            " OR t.owner_master_uid = ?)"
         )
-        params.extend([master_uid, master_uid, master_uid])
+        params.extend([master_uid, master_uid])
     # scope == 'all' — без дополнительных условий, видимость фильтруется ниже
 
     if status_filter:
         clauses.append("t.status = ?")
-        params.append(to_db_status(status_filter))
+        params.append(status_filter)
 
     db_workshop = workshop_id_to_db(workshop_id)
     if db_workshop is not None:
         # Цех заявки: собственный, иначе цех её владельца.
         clauses.append(
             "COALESCE(t.workshop_id, (SELECT m.workshop_id FROM api_masters m "
-            "  WHERE m.master_uid = COALESCE(t.owner_master_uid, "
-            "    (SELECT m2.master_uid FROM api_masters m2 "
-            "     WHERE CAST(m2.legacy_user_id AS INTEGER) = t.taken_by)))) = ?"
+            "  WHERE m.master_uid = t.owner_master_uid)) = ?"
         )
         params.append(db_workshop)
 
@@ -569,11 +479,10 @@ def list_tickets(
     with reading() as connection:
         rows = connection.execute(
             f"""
-            SELECT t.id, t.status, t.workshop_id, t.subject, t.created_at, t.updated_at,
-                   t.client_id, t.client_name, t.taken_by, t.owner_master_uid,
-                   o.master_uid AS owner_uid,
-                   o.full_name AS owner_name, o.workshop_id AS owner_workshop_id,
-                   w.name AS workshop_name
+SELECT t.id, t.status, t.workshop_id, t.subject, t.created_at, t.updated_at,
+               t.client_id, t.client_name, t.owner_master_uid,
+               o.master_uid AS owner_uid,
+               w.name AS workshop_name
             FROM tickets t
             {_OWNER_JOIN}
             LEFT JOIN workshops w   ON w.id = COALESCE(t.workshop_id, o.workshop_id)
@@ -907,7 +816,7 @@ def append_incoming_message(
 
     def _work(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         ticket = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
-        if not ticket or to_api_status(ticket["status"]) == STATUS_CLOSED:
+        if not ticket or ticket["status"] == STATUS_CLOSED:
             return None
 
         now = _now()
@@ -1047,10 +956,10 @@ def accept_ticket(
         if not row:
             raise errors.ticket_not_found(ticket_id)
 
-        if to_api_status(row["status"]) == STATUS_CLOSED:
+        if row["status"] == STATUS_CLOSED:
             raise errors.ticket_closed(ticket_id)
 
-        if to_api_status(row["status"]) == STATUS_IN_PROGRESS:
+        if row["status"] == STATUS_IN_PROGRESS:
             # Кто-то уже взял — сообщаем имя, чтобы клиент показал
             # «Заявку уже взял Фёдор Семёнов».
             owner = _owner_of(connection, ticket_id)
@@ -1063,7 +972,7 @@ def accept_ticket(
         cursor = connection.execute(
             """
             UPDATE tickets
-               SET status = 'taken',
+               SET status = 'in_progress',
                    owner_master_uid = ?,
                    updated_at = ?
              WHERE id = ? AND status = 'new'
@@ -1119,13 +1028,13 @@ def release_ticket(
         require_open(connection, ticket_id)
 
         row = connection.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
-        if to_api_status(row["status"]) == STATUS_NEW:
+        if row["status"] == STATUS_NEW:
             raise errors.ticket_not_in_feed(ticket_id)
 
         connection.execute(
             """
             UPDATE tickets
-               SET status = 'new', taken_by = NULL, owner_master_uid = NULL, updated_at = ?
+               SET status = 'new', owner_master_uid = NULL, updated_at = ?
              WHERE id = ?
             """,
             (now, ticket_id),
@@ -1219,13 +1128,13 @@ def reopen_ticket(
         row = connection.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         if not row:
             raise errors.ticket_not_found(ticket_id)
-        if to_api_status(row["status"]) != STATUS_CLOSED:
+        if row["status"] != STATUS_CLOSED:
             raise errors.forbidden("Заявка и так не закрыта", ticket_id=ticket_id)
 
         connection.execute(
             """
             UPDATE tickets
-               SET status = 'taken', closed_at = NULL, close_reason = NULL, updated_at = ?
+               SET status = 'in_progress', closed_at = NULL, close_reason = NULL, updated_at = ?
              WHERE id = ?
             """,
             (now, ticket_id),
@@ -1266,16 +1175,6 @@ def decline_ticket(master: Master, ticket_id: str, reason: Optional[str] = None)
             (ticket_id, master.master_uid, reason, _now()),
         )
         return row.rowcount >= 0
-
-
-def undecline_ticket(master_uid: str, ticket_id: str) -> bool:
-    """Вернуть заявку в ленту (если раньше от неё отказались)."""
-    with transaction() as connection:
-        cursor = connection.execute(
-            "DELETE FROM ticket_declines WHERE ticket_id = ? AND master_uid = ?",
-            (ticket_id, master_uid),
-        )
-        return cursor.rowcount > 0
 
 
 # ==================== Участники ====================

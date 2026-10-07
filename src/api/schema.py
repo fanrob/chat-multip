@@ -1,6 +1,6 @@
 """Схема для мессенджера: миграции поверх существующего full.db.
 
-Существующие таблицы (tickets, masters, workshops, operator_messages, settings)
+Существующие таблицы (tickets, workshops, operator_messages, settings)
 не трогаем — бот продолжает ими пользоваться. Здесь только то, чего для
 мессенджера не хватает:
 
@@ -11,13 +11,19 @@
     events             лента событий с курсором (seq)
     api_outbox         сообщения, ждущие отправки в Telegram/Viber
 
+Старая таблица masters (Telegram) выпилена миграцией 14: мастеры работают
+только в приложении и живут в api_masters.
+
 Версия схемы хранится в PRAGMA user_version. Миграции применяются по порядку
 и идемпотентны, поэтому безопасно вызывать apply() при каждом старте.
 
+Нумерация шагов идёт с пропусками (7, 11, 12, 13 сняты слитно в финальные
+DDL ниже) — это позволяет не понижать user_version уже применённым базам.
+
 API обязан подниматься без Telegram-бота, поэтому базовые legacy-таблицы
-создаёт он сам (см. LEGACY_TABLES): иначе миграции, которые только ALTERят
-`tickets`, падают на пустой базе. У бота та же DDL остаётся через
-CREATE TABLE IF NOT EXISTS — на общей базе это безвредно.
+создаёт он сам (см. LEGACY_TABLES) — сразу в финальной форме, без цепочки
+ALTER. У бота та же DDL остаётся через CREATE TABLE IF NOT EXISTS — на общей
+базе это безвредно.
 """
 
 import logging
@@ -29,13 +35,14 @@ from api.db import db_path, transaction
 
 logger = logging.getLogger(__name__)
 
-#: Версия схемы = номер последней миграции. Считается из списка MIGRATIONS,
-#: чтобы добавление миграции не требовало ручной правки константы.
+#: Версия схемы = номер последней миграции. Считается из списка, чтобы
+#: добавление миграции не требовало ручной правки константы.
 Migration = Tuple[int, str, Callable[[], List[str]]]
 
-#: Базовые таблицы бота. API создаёт их сам, чтобы подняться на пустой базе.
-#: DDL совпадает с src/storage.py и src/config.py: на общей базе CREATE TABLE
-#: IF NOT EXISTS для второй стороны не делает ничего.
+#: Базовые таблицы бота. API создаёт их сам (в финальной форме), чтобы
+#: подняться на пустой базе. DDL совпадает с src/storage.py: на общей базе
+#: CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS для второй стороны
+#: не делает ничего.
 LEGACY_TABLES: List[str] = [
     """
     CREATE TABLE IF NOT EXISTS tickets (
@@ -45,31 +52,23 @@ LEGACY_TABLES: List[str] = [
         client_name TEXT NOT NULL,
         text TEXT NOT NULL,
         status TEXT NOT NULL,
-        taken_by INTEGER,
         created_at TEXT NOT NULL,
         message_id TEXT,
         subject TEXT NOT NULL DEFAULT '',
-        workshop_id INTEGER
+        workshop_id INTEGER,
+        updated_at TEXT,
+        closed_at TEXT,
+        close_reason TEXT,
+        owner_master_uid TEXT
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tickets_workshop ON tickets(workshop_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tickets_owner ON tickets(owner_master_uid)",
     """
     CREATE TABLE IF NOT EXISTS operator_messages (
         message_id INTEGER PRIMARY KEY,
-        operator_id INTEGER NOT NULL,
-        ticket_id TEXT NOT NULL,
-        sent_at TEXT NOT NULL,
-        sender TEXT NOT NULL DEFAULT '',
-        sender_id TEXT,
-        text TEXT NOT NULL DEFAULT ''
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS masters (
-        user_id INTEGER PRIMARY KEY,
-        full_name TEXT,
-        added_at TEXT NOT NULL,
-        is_deleted INTEGER DEFAULT 0,
-        workshop_id INTEGER
+        ticket_id TEXT NOT NULL
     )
     """,
     """
@@ -100,9 +99,8 @@ def _create_legacy_tables(connection: sqlite3.Connection) -> None:
 def _masters_v1() -> List[str]:
     """Экземпляры приложений мастеров.
 
-    Отдельная таблица, а не колонка в masters: masters.user_id — это Telegram ID,
-    а в мессенджере мастер работает без Telegram-аккаунта. Связь с заявками идёт
-    по api_masters.master_uid, который не зависит ни от Telegram, ни от Viber.
+    Связь с заявками идёт по api_masters.master_uid ('m_...'), который не
+    зависит ни от Telegram, ни от Viber.
     """
     return [
         """
@@ -113,9 +111,7 @@ def _masters_v1() -> List[str]:
             workshop_id  INTEGER,
             is_active    INTEGER NOT NULL DEFAULT 1,
             created_at   TEXT NOT NULL,
-            last_seen_at TEXT,
-            -- null, пока мастер не привязан к мастеру из бота
-            legacy_user_id INTEGER
+            last_seen_at TEXT
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_api_masters_workshop ON api_masters(workshop_id)",
@@ -126,8 +122,8 @@ def _masters_v1() -> List[str]:
 def _ticket_members_v1() -> List[str]:
     """Кто имеет доступ к заявке.
 
-    owner хранится в tickets.taken_by (уже есть, бот его использует) и в
-    tickets.status. Здесь — участники сверх владельца.
+    Владелец заявки хранится в tickets.owner_master_uid и tickets.status.
+    Здесь — участники сверх владельца.
     """
     return [
         """
@@ -174,12 +170,19 @@ def _messages_v1() -> List[str]:
 
 
 def _attachments_v1() -> List[str]:
+    """Вложения клиента и мастера.
+
+    master_uid — кому файл принадлежит до привязки к заявке: мастер грузит
+    файл отдельным запросом и лишь потом отправляет сообщение, и в промежутке
+    вложение видно только загрузившему, а не всем участникам заявки.
+    """
     return [
         """
         CREATE TABLE IF NOT EXISTS api_attachments (
             id          TEXT PRIMARY KEY,
             ticket_id   TEXT,
             message_id  TEXT,
+            master_uid  TEXT,
             source      TEXT NOT NULL,
             channel     TEXT NOT NULL DEFAULT 'telegram',
             filename    TEXT NOT NULL DEFAULT '',
@@ -191,6 +194,7 @@ def _attachments_v1() -> List[str]:
         """,
         "CREATE INDEX IF NOT EXISTS idx_attachments_message ON api_attachments(message_id)",
         "CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON api_attachments(ticket_id)",
+        "CREATE INDEX IF NOT EXISTS idx_attachments_master ON api_attachments(master_uid)",
     ]
 
 
@@ -239,37 +243,6 @@ def _outbox_v1() -> List[str]:
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_outbox_status ON api_outbox(status, id)",
-    ]
-
-
-def _tickets_extra_v1() -> List[str]:
-    """Дополнительные поля заявки, которых нет в существующей таблице.
-
-    ALTER TABLE с проверкой: если колонка уже есть, CREATE INDEX на неё
-    не падает, а ALTER не выполняется.
-    """
-    return [
-        "ALTER TABLE tickets ADD COLUMN updated_at TEXT",
-        "ALTER TABLE tickets ADD COLUMN closed_at TEXT",
-        "ALTER TABLE tickets ADD COLUMN close_reason TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, created_at)",
-    ]
-
-
-def _tickets_workshop_v11() -> List[str]:
-    """workshop_id для заявок — отдельной миграцией, а не в составе 7-й.
-
-    storage.py объявляет tickets с workshop_id, но CREATE TABLE IF NOT EXISTS
-    на уже существующей таблице ничего не меняет: в боевой full.db колонки нет.
-    Из-за этого любой запрос, её читающий, падал с "no such column: t.workshop_id".
-
-    Вынесено отдельным шагом, потому что к этому моменту миграция 7 уже была
-    применена на части установок — там user_version = 10, и новый шаг 11
-    дойдёт до них, а изменение старой миграции — нет.
-    """
-    return [
-        "ALTER TABLE tickets ADD COLUMN workshop_id INTEGER",
-        "CREATE INDEX IF NOT EXISTS idx_tickets_workshop ON tickets(workshop_id)",
     ]
 
 
@@ -328,57 +301,70 @@ def _declines_v1() -> List[str]:
     ]
 
 
-def _ticket_owner_v12() -> List[str]:
-    """owner_master_uid — владелец заявки по данным API.
+def _drop_legacy_v14() -> List[str]:
+    """Выпиливает хвосты Telegram-мастеров.
 
-    Почему не переиспользуем tickets.taken_by: это INTEGER с Telegram ID,
-    и бот сравнивает его с целым числом (WHERE taken_by = ?). Положив туда
-    строку 'm_...', мы бы сломали его выборки — SQLite по INTEGER-аффинности
-    оставил бы значение текстом и сравнение перестало бы совпадать.
-
-    Поэтому владелец из приложения лежит здесь, а taken_by продолжает
-    означать Telegram ID. Если заявку взял бот — заполнен taken_by,
-    если приложение — owner_master_uid. Владелец один из двух.
+    masters — таблица операторов Telegram-бота: мастеры перешли в приложение
+    (api_masters), таблица больше не нужна. Колонки taken_by (tickets) и
+    legacy_user_id (api_masters) были сняты той же миграцией в её ранней
+    редакции — на уже обновлённых базах их нет, на свежих их не существует.
     """
     return [
-        "ALTER TABLE tickets ADD COLUMN owner_master_uid TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_tickets_owner ON tickets(owner_master_uid)",
+        "DROP TABLE IF EXISTS masters",
     ]
 
 
-def _attachment_owner_v13() -> List[str]:
-    """master_uid во вложениях — кому файл принадлежит до привязки к заявке.
+def _status_vocabulary_v15() -> List[str]:
+    """Переводит оставшиеся 'taken' в единый словарь 'in_progress'.
 
-    Мастер грузит файл отдельным запросом и лишь потом отправляет сообщение.
-    В промежутке вложение не привязано ни к заявке, ни к сообщению, и правило
-    «видно участникам заявки» к нему неприменимо: заявки-то ещё нет.
-
-    Раньше такой файл возвращал can_access() = True любому мастеру, кто знает
-    id. id — это 12 hex-символов (48 бит), перебор вряд ли практичен, но
-    правильность доступа не должна держаться на секретности id: по этой колонке
-    файл виден только загрузившему, а после отправки сообщения — участникам
-    заявки.
+    Хвосты миграции на статусы могли уцелеть на базах, обновлённых до
+    единого словаря (заявки, взятые старым API). Больше 'taken' ничего не
+    пишет: боты пишут 'new'/'closed', API — 'in_progress'.
     """
     return [
-        "ALTER TABLE api_attachments ADD COLUMN master_uid TEXT",
-        "CREATE INDEX IF NOT EXISTS idx_attachments_master ON api_attachments(master_uid)",
+        "UPDATE tickets SET status = 'in_progress' WHERE status = 'taken'",
+    ]
+
+
+def _slim_operator_messages_v16() -> List[str]:
+    """Сужает operator_messages до связки message_id -> ticket_id.
+
+    Раньше хранились operator_id/sent_at/sender/text — под диалог, которого
+    нет: бот использует только get_ticket_id(). UNIQUE-колонок именно это
+    сужение и есть следующая ячейка; историю ответов держит messages.
+
+    Пересборка через новую таблицу: штатный DROP COLUMN требует SQLite >= 3.35
+    и спотыкается на inline-комментариях. Идемпотентно на любой базе — на
+    свежей (уже slim) перенос пуст, на боевой — сохраняет message_id/ticket_id.
+    """
+    return [
+        "DROP TABLE IF EXISTS operator_messages_new",
+        """
+        CREATE TABLE operator_messages_new (
+            message_id INTEGER PRIMARY KEY,
+            ticket_id TEXT NOT NULL
+        )
+        """,
+        "INSERT INTO operator_messages_new (message_id, ticket_id) "
+        "SELECT message_id, ticket_id FROM operator_messages",
+        "DROP TABLE operator_messages",
+        "ALTER TABLE operator_messages_new RENAME TO operator_messages",
     ]
 
 
 MIGRATIONS: List[Migration] = [
-    (1, "masters", _masters_v1),
+    (1, "api_masters", _masters_v1),
     (2, "ticket_members", _ticket_members_v1),
     (3, "messages", _messages_v1),
     (4, "attachments", _attachments_v1),
     (5, "events", _events_v1),
     (6, "outbox", _outbox_v1),
-    (7, "tickets_extra", _tickets_extra_v1),
     (8, "ticket_seq", _ticket_seq_v1),
     (9, "read_state", _read_state_v1),
     (10, "declines", _declines_v1),
-    (11, "tickets_workshop", _tickets_workshop_v11),
-    (12, "ticket_owner", _ticket_owner_v12),
-    (13, "attachment_owner", _attachment_owner_v13),
+    (14, "drop_legacy", _drop_legacy_v14),
+    (15, "status_vocabulary", _status_vocabulary_v15),
+    (16, "slim_operator_messages", _slim_operator_messages_v16),
 ]
 
 #: Версия схемы = номер последней миграции. Считается из списка, чтобы
@@ -388,11 +374,6 @@ SCHEMA_VERSION: int = max(step for step, _, _ in MIGRATIONS)
 
 def _current_version(connection: sqlite3.Connection) -> int:
     return connection.execute("PRAGMA user_version").fetchone()[0]
-
-
-def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
-    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(row["name"] == column for row in rows)
 
 
 def apply(path: str | None = None) -> int:
@@ -407,15 +388,15 @@ def apply(path: str | None = None) -> int:
 
     with transaction(target) as connection:
         version = _current_version(connection)
-        # База может быть пустой (сервер без бота) — сначала legacy-таблицы,
-        # иначе миграции с ALTER TABLE упадут на отсутствующей tickets.
+        # База может быть пустой (сервер без бота) — сначала legacy-таблицы
+        # в финальной форме, иначе миграции упадут на отсутствующей tickets.
         _create_legacy_tables(connection)
 
         for step, name, statements in MIGRATIONS:
             if step <= version:
                 continue
             for statement in statements():
-                _run_migration(connection, statement)
+                connection.execute(statement)
             logger.info("Миграция %d (%s) применена", step, name)
 
         version = _current_version(connection)
@@ -423,40 +404,6 @@ def apply(path: str | None = None) -> int:
 
     logger.info("Схема мессенджера готова, версия %d", SCHEMA_VERSION)
     return SCHEMA_VERSION
-
-
-def _run_migration(connection: sqlite3.Connection, statement: str) -> None:
-    """Выполняет одну инструкцию, пропуская повторные ALTER TABLE."""
-    stripped = statement.strip()
-    if stripped.upper().startswith("ALTER TABLE"):
-        table, column = _parse_alter_add_column(stripped)
-        if table and column and _column_exists(connection, table, column):
-            logger.debug("Колонка %s.%s уже есть, пропуск", table, column)
-            return
-    connection.execute(stripped)
-
-
-def _parse_alter_add_column(statement: str) -> Tuple[str, str]:
-    """Достаёт имя таблицы и колонки из 'ALTER TABLE t ADD COLUMN c TYPE'.
-
-    Порядок слов не фиксирован (можно ALTER TABLE t ADD c TYPE), поэтому
-    ищем по ключевым словам, а не по индексам.
-    """
-    parts = [part for part in statement.split() if part]
-    if len(parts) < 4:
-        return "", ""
-    try:
-        table = parts[parts.index("TABLE") + 1]
-    except (ValueError, IndexError):
-        return "", ""
-    column = ""
-    for keyword in ("COLUMN", "ADD"):
-        if keyword in parts:
-            after = parts.index(keyword) + 1
-            if after < len(parts):
-                column = parts[after]
-                break
-    return table, column
 
 
 def reset_for_tests(path: str) -> None:
@@ -475,5 +422,5 @@ def reset_for_tests(path: str) -> None:
     with transaction(path) as connection:
         for table in tables:
             connection.execute(f"DROP TABLE IF EXISTS {table}")
-        # Колонки в tickets не удаляем: SQLite не умеет DROP COLUMN.
+        # Колонки в tickets не трогаем: таблица принадлежит боту.
         connection.execute("PRAGMA user_version = 0")

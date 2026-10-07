@@ -31,7 +31,8 @@ def test_schema_applies_to_empty_database(tmp_path):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-    assert {"tickets", "masters", "workshops", "operator_messages", "settings"} <= tables
+    assert {"tickets", "workshops", "operator_messages", "settings"} <= tables
+    assert "masters" not in tables
     assert version == schema.SCHEMA_VERSION
 
 

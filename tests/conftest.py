@@ -2,7 +2,7 @@
 
 Тесты работают на копии боевой БД из full.db: так проверяется, что схема
 накладывается на реальные данные бота (5-значные id заявок, статусы
-new/taken), а не только на пустую базу, которую создаст CREATE TABLE.
+new/in_progress), а не только на пустую базу, которую создаст CREATE TABLE.
 """
 
 import shutil
@@ -53,9 +53,9 @@ def isolate_legacy_storages(db_path, monkeypatch) -> None:
     привязку отправленных сообщений через operator_message_storage.
     """
     from config import settings_storage
-    from storage import master_storage, operator_message_storage, ticket_storage
+    from storage import operator_message_storage, ticket_storage, workshop_storage
 
-    for storage in (ticket_storage, operator_message_storage, master_storage, settings_storage):
+    for storage in (ticket_storage, operator_message_storage, workshop_storage, settings_storage):
         monkeypatch.setattr(storage, "db_path", db_path)
 
 
@@ -114,10 +114,10 @@ def seed_ticket(client, headers, ticket_id: str = "t_test01") -> str:
         connection.execute(
             """
             INSERT OR IGNORE INTO tickets
-                (id, source, client_id, client_name, text, status, taken_by, created_at,
+                (id, source, client_id, client_name, text, status, created_at,
                  message_id, subject)
             VALUES (?, 'telegram', '12345', 'Иван П.', 'Не могу пригнать машину',
-                    'new', NULL, ?, 1, 'Левый баккер')
+                    'new', ?, 1, 'Левый баккер')
             """,
             (ticket_id, now),
         )

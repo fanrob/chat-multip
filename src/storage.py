@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from config import FULL_DB, DEFAULT_OPERATOR_IDS
+from config import FULL_DB
 from models import Ticket
 
 logger = logging.getLogger(__name__)
@@ -22,13 +22,25 @@ class TicketStorage:
                     client_name TEXT NOT NULL,
                     text TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    taken_by INTEGER,
                     created_at TEXT NOT NULL,
                     message_id TEXT,
                     subject TEXT NOT NULL DEFAULT '',
-                    workshop_id INTEGER
+                    workshop_id INTEGER,
+                    updated_at TEXT,
+                    closed_at TEXT,
+                    close_reason TEXT,
+                    owner_master_uid TEXT
                 )
                 """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, created_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tickets_workshop ON tickets(workshop_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tickets_owner ON tickets(owner_master_uid)"
             )
 
     def get_all_ids(self) -> set[str]:
@@ -46,7 +58,6 @@ class TicketStorage:
             client_name=row['client_name'],
             text=row['text'],
             status=row['status'],
-            taken_by=row['taken_by'],
             created_at=datetime.fromisoformat(row['created_at']),
             message_id=row['message_id'],
             subject=row['subject'],
@@ -58,22 +69,21 @@ class TicketStorage:
             connection.execute(
                 """
                 INSERT INTO tickets
-                    (id, source, client_id, client_name, text, status, taken_by, created_at, message_id, subject, workshop_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, source, client_id, client_name, text, status, created_at, message_id, subject, workshop_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     source = excluded.source,
                     client_id = excluded.client_id,
                     client_name = excluded.client_name,
                     text = excluded.text,
                     status = excluded.status,
-                    taken_by = excluded.taken_by,
                     created_at = excluded.created_at,
                     message_id = excluded.message_id,
                     subject = excluded.subject,
                     workshop_id = excluded.workshop_id
                 """,
                 (ticket.id, ticket.source, ticket.client_id, ticket.client_name,
-                 ticket.text, ticket.status, ticket.taken_by, ticket.created_at.isoformat(),
+                 ticket.text, ticket.status, ticket.created_at.isoformat(),
                  ticket.message_id, ticket.subject, ticket.workshop_id),
             )
 
@@ -93,7 +103,7 @@ class TicketStorage:
         with sqlite3.connect(self.db_path) as connection:
             connection.row_factory = sqlite3.Row
             row = connection.execute(
-                "SELECT * FROM tickets WHERE client_id = ? AND status IN ('new', 'taken') ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM tickets WHERE client_id = ? AND status != 'closed' ORDER BY created_at DESC LIMIT 1",
                 (client_id,)
             ).fetchone()
         return self.from_row(row) if row else None
@@ -103,7 +113,7 @@ ticket_storage = TicketStorage()
 
 
 class OperatorMessageStorage:
-    """Привязка сообщений Telegram к заявкам.
+    """Карта message_id сообщения клиенту -> заявка.
 
     Ключ — message_id отправленного клиенту сообщения: по реплаю на него бот
     понимает, в какую заявку попадёт ответ клиента.
@@ -116,29 +126,18 @@ class OperatorMessageStorage:
                 """
                 CREATE TABLE IF NOT EXISTS operator_messages (
                     message_id INTEGER PRIMARY KEY,
-                    operator_id INTEGER NOT NULL,
-                    ticket_id TEXT NOT NULL,
-                    sent_at TEXT NOT NULL,
-                    sender TEXT NOT NULL DEFAULT '',
-                    sender_id TEXT,
-                    text TEXT NOT NULL DEFAULT ''
+                    ticket_id TEXT NOT NULL
                 )
                 """
             )
 
-    def add(self, message_id: int, operator_id: int, ticket_id: str,
-            sender: str = '', sender_id: str = None, text: str = ''):
-        """Сохраняет сообщение.
-        sender: 'op' или 'client' — кто автор сообщения (для диалога).
-        Если sender пустой, сообщение считается служебным и в диалог не попадает.
-        """
+    def add(self, message_id: int, ticket_id: str):
+        """Запоминает, что сообщение (message_id) относится к заявке."""
         with sqlite3.connect(self.db_path) as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO operator_messages "
-                "(message_id, operator_id, ticket_id, sent_at, sender, sender_id, text) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (message_id, operator_id, ticket_id, datetime.now().isoformat(),
-                 sender, sender_id, text),
+                "INSERT OR IGNORE INTO operator_messages (message_id, ticket_id) "
+                "VALUES (?, ?)",
+                (message_id, ticket_id),
             )
 
 
@@ -154,24 +153,13 @@ class OperatorMessageStorage:
 operator_message_storage = OperatorMessageStorage()
 
 
-class MasterStorage:
-    """Реестр мастеров и цехов (админские данные, общие для бота и API)."""
+class WorkshopStorage:
+    """Цеха. Мастера живут в api_masters и управляются из приложения,
+    в таблице masters бот больше не нуждается."""
 
     def __init__(self, db_path: str = FULL_DB):
         self.db_path = db_path
         with sqlite3.connect(self.db_path) as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS masters (
-                    user_id INTEGER PRIMARY KEY,
-                    full_name TEXT,
-                    added_at TEXT NOT NULL,
-                    is_deleted INTEGER DEFAULT 0,
-                    workshop_id INTEGER
-                )
-                """
-            )
-
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workshops (
@@ -180,86 +168,6 @@ class MasterStorage:
                 )
                 """
             )
-
-            fresh_db = connection.execute(
-                "SELECT COUNT(*) FROM masters"
-            ).fetchone()[0] == 0
-
-        if fresh_db:
-            for user_id in DEFAULT_OPERATOR_IDS:
-                self.add(user_id)
-
-    def add(self, user_id: int, full_name: str = "", workshop_id: Optional[int] = None):
-        """Добавляет мастера. Если был удален - восстанавливает."""
-        with sqlite3.connect(self.db_path) as connection:
-            # Проверяем, существует ли мастер
-            existing = connection.execute(
-                "SELECT is_deleted, workshop_id FROM masters WHERE user_id = ?", (user_id,)
-            ).fetchone()
-            
-            if existing:
-                if existing[0] == 1:  # Был удален
-                    # Восстанавливаем (цех, если не передан, сохраняем старый)
-                    new_workshop = workshop_id if workshop_id is not None else existing[1]
-                    connection.execute(
-                        "UPDATE masters SET is_deleted = 0, full_name = ?, workshop_id = ? WHERE user_id = ?",
-                        (full_name or "", new_workshop, user_id)
-                    )
-                    logger.info(f"🔄 мастер {user_id} ({full_name}) восстановлен!")
-                else:
-                    # Просто обновляем имя/цех, если они переданы
-                    updates = []
-                    params = []
-                    if full_name:
-                        updates.append("full_name = ?")
-                        params.append(full_name)
-                    if workshop_id is not None:
-                        updates.append("workshop_id = ?")
-                        params.append(workshop_id)
-                    if updates:
-                        params.append(user_id)
-                        connection.execute(
-                            f"UPDATE masters SET {', '.join(updates)} WHERE user_id = ?",
-                            tuple(params)
-                        )
-            else:
-                # Новый мастер
-                connection.execute(
-                    "INSERT INTO masters (user_id, full_name, added_at, is_deleted, workshop_id) VALUES (?, ?, ?, 0, ?)",
-                    (user_id, full_name, datetime.now().isoformat(), workshop_id),
-                )
-
-    def delete(self, user_id: int) -> bool:
-        """Мягко удаляет мастера (помечает как удаленного)."""
-        with sqlite3.connect(self.db_path) as connection:
-            cursor = connection.execute(
-                "UPDATE masters SET is_deleted = 1 WHERE user_id = ? AND is_deleted = 0",
-                (user_id,)
-            )
-        return cursor.rowcount > 0
-
-    def all(self, include_deleted: bool = False):
-        """Возвращает список мастеров (с названием цеха). По умолчанию только активных."""
-        with sqlite3.connect(self.db_path) as connection:
-            connection.row_factory = sqlite3.Row
-            query = (
-                "SELECT m.user_id, m.full_name, m.added_at, m.is_deleted, m.workshop_id, "
-                "w.name AS workshop_name "
-                "FROM masters m LEFT JOIN workshops w ON m.workshop_id = w.id"
-            )
-            if include_deleted:
-                return connection.execute(query + " ORDER BY m.added_at").fetchall()
-            else:
-                return connection.execute(
-                    query + " WHERE m.is_deleted = 0 ORDER BY m.added_at"
-                ).fetchall()
-
-    def exists(self, user_id: int) -> bool:
-        """Проверяет, существует ли активный мастер."""
-        with sqlite3.connect(self.db_path) as connection:
-            return connection.execute(
-                "SELECT 1 FROM masters WHERE user_id = ? AND is_deleted = 0", (user_id,)
-            ).fetchone() is not None
 
     # ==================== ЦЕХА ====================
 
@@ -280,7 +188,7 @@ class MasterStorage:
         """
         with sqlite3.connect(self.db_path) as connection:
             reset = connection.execute(
-                "UPDATE masters SET workshop_id = NULL WHERE workshop_id = ?",
+                "UPDATE api_masters SET workshop_id = NULL WHERE workshop_id = ?",
                 (workshop_id,)
             )
             deleted = connection.execute(
@@ -295,8 +203,8 @@ class MasterStorage:
         with sqlite3.connect(self.db_path) as connection:
             connection.row_factory = sqlite3.Row
             return connection.execute(
-                "SELECT * FROM workshops ORDER BY name"
-            ).fetchall()
+                "SELECT * FROM workshops ORDER BY id"
+            ).fetchall()    #сортируем по id, то есть в порядке создания
 
     def get_workshop_name(self, workshop_id: Optional[int]) -> Optional[str]:
         """Возвращает название цеха по ID (None, если цех не задан или не найден)."""
@@ -309,15 +217,12 @@ class MasterStorage:
         return row[0] if row else None
 
 
-master_storage = MasterStorage()
+workshop_storage = WorkshopStorage()
 
-
-def is_operator(user_id: int) -> bool:
-    return master_storage.exists(user_id)
 
 def is_admin(user_id: int) -> bool:
     """Проверяет, является ли пользователь администратором."""
-    with sqlite3.connect(master_storage.db_path) as connection:
+    with sqlite3.connect(workshop_storage.db_path) as connection:
         db = connection.execute(
             "SELECT value FROM settings WHERE key = 'admin_id'",
         ).fetchone()
@@ -327,17 +232,51 @@ def is_admin(user_id: int) -> bool:
 
 def get_admin_id() -> int:
     """Возвращает текущий ID администратора из настроек."""
-    with sqlite3.connect(master_storage.db_path) as connection:
+    with sqlite3.connect(workshop_storage.db_path) as connection:
         row = connection.execute(
             "SELECT value FROM settings WHERE key = 'admin_id'",
         ).fetchone()
     return int(row[0]) if row else 0
 
-def get_operator_ids(workshop_id: Optional[int] = None):
-    """Возвращает ID мастеров. Если задан цех - только мастеров этого цеха."""
-    if workshop_id is None:
-        return [row["user_id"] for row in master_storage.all()]
-    return [
-        row["user_id"] for row in master_storage.all()
-        if row["workshop_id"] == workshop_id
-    ]
+
+# ==================== Мастера (api_masters) ====================
+# Таблица masters (Telegram) удалена: мастеры работают только в приложении
+# и живут в api_masters. Бот читает её для админ-панели и гейта по цеху.
+
+
+def list_api_masters(active_only: bool = True):
+    """Мастера для админ-панели бота (с названием цеха)."""
+    with sqlite3.connect(workshop_storage.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        query = (
+            "SELECT m.master_uid, m.full_name, m.workshop_id, m.is_active, "
+            "m.last_seen_at, w.name AS workshop_name "
+            "FROM api_masters m LEFT JOIN workshops w ON m.workshop_id = w.id"
+        )
+        if active_only:
+            return connection.execute(
+                query + " WHERE m.is_active = 1 ORDER BY m.full_name, m.master_uid"
+            ).fetchall()
+        return connection.execute(
+            query + " ORDER BY m.full_name, m.master_uid"
+        ).fetchall()
+
+
+def workshop_has_masters(workshop_id: int) -> bool:
+    """Есть ли в цехе хотя бы один активный мастер (из приложения)."""
+    with sqlite3.connect(workshop_storage.db_path) as connection:
+        return connection.execute(
+            "SELECT 1 FROM api_masters WHERE workshop_id = ? AND is_active = 1",
+            (workshop_id,),
+        ).fetchone() is not None
+
+
+def set_master_active(master_uid: str, active: bool) -> bool:
+    """Отключает (или включает) мастера по master_uid. True, если состояние изменилось."""
+    value = 1 if active else 0
+    with sqlite3.connect(workshop_storage.db_path) as connection:
+        cursor = connection.execute(
+            "UPDATE api_masters SET is_active = ? WHERE master_uid = ? AND is_active != ?",
+            (value, master_uid, value),
+        )
+    return cursor.rowcount > 0

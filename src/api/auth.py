@@ -49,6 +49,7 @@ class Master:
     workshop_id: Optional[int]
     is_active: bool
     created_at: str
+    last_seen_at: Optional[str]
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Master":
@@ -59,6 +60,7 @@ class Master:
             workshop_id=row["workshop_id"],
             is_active=bool(row["is_active"]),
             created_at=row["created_at"],
+            last_seen_at=row["last_seen_at"],
         )
 
 
@@ -174,15 +176,6 @@ def touch(master_uid: str) -> None:
             "UPDATE api_masters SET last_seen_at = ? WHERE master_uid = ?",
             (_now(), master_uid),
         )
-
-
-def list_masters() -> List[Master]:
-    """Все активные мастера — для списка участников заявки."""
-    with reading() as connection:
-        rows = connection.execute(
-            "SELECT * FROM api_masters WHERE is_active = 1 ORDER BY full_name, master_uid"
-        ).fetchall()
-    return [Master.from_row(row) for row in rows]
 
 
 def workshop_name(workshop_id: Optional[int]) -> Optional[str]:

@@ -2,12 +2,6 @@ import re
 from typing import Optional
 
 
-def escape_markdown(text: str) -> str:
-    """Экранирует спецсимволы для MarkdownV2"""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
-
-
 def extract_last_message(email_text: str) -> str:
     """
     Извлекает последнее сообщение из тела письма,

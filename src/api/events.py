@@ -18,10 +18,10 @@ import json
 import logging
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
-from api.db import reading, transaction
+from api.db import reading
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +41,6 @@ MASTERS_DIRECTORY_CHANGED = "masters.directory_changed"
 #: Максимум событий за один ответ — защита от огромного JSON при потоке.
 MAX_LIMIT = 500
 
-#: Сколько событий чистим за раз, если таблица разрослась.
-PRUNE_BATCH = 1000
-
 #: Удержание long-poll по умолчанию, сек. Ровно то, что ждёт клиент из README.
 DEFAULT_WAIT_SECONDS = 25
 
@@ -53,7 +50,7 @@ MAX_WAIT_SECONDS = 60
 
 #: Как часто проверять ленту, пока ждём событий. Меньше — отзывчивее и
 #: дороже; 0.5 секунды для 5–7 клиентов — это меньше 15 запросов в секунду.
-POLL_INTERVAL_SECONDS = 0.5
+POLL_INTERVAL_SECONDS = 1
 
 
 def _now() -> str:
@@ -103,31 +100,6 @@ def emit_all(
     """
     rows = connection.execute(
         "SELECT master_uid FROM api_masters WHERE is_active = 1"
-    ).fetchall()
-    emit(connection, [row["master_uid"] for row in rows], event_type, data, ticket_id)
-
-
-def emit_to_feed(
-    connection: sqlite3.Connection,
-    event_type: str,
-    data: Optional[Dict[str, Any]] = None,
-    ticket_id: Optional[str] = None,
-) -> None:
-    """Событие тем мастерам, у кого заявка не скрыта отказом.
-
-    Отказавшийся мастер не должен получать события по заявке, которую он
-    отклонил, — иначе в его ленте она всплывёт снова.
-    """
-    rows = connection.execute(
-        """
-        SELECT m.master_uid FROM api_masters m
-        WHERE m.is_active = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM ticket_declines d
-              WHERE d.ticket_id = ? AND d.master_uid = m.master_uid
-          )
-        """,
-        (ticket_id,),
     ).fetchall()
     emit(connection, [row["master_uid"] for row in rows], event_type, data, ticket_id)
 
@@ -255,36 +227,6 @@ def validate_cursor(master_uid: str, cursor: int) -> int:
         logger.warning("Курсор %s больше последнего seq %s — нужен ресинк", cursor, latest)
         return 0
     return cursor
-
-
-def prune(retention_days: int = 30, batch: int = PRUNE_BATCH) -> int:
-    """Удаляет старые события. Возвращает количество удалённых строк.
-
-    События нужны только для догоняющих клиентов; записи месячной давности
-    можно уже не хранить, иначе таблица растёт без ограничений. Удаляем
-    по частям, чтобы не держать долгую блокировку записи.
-    """
-    threshold = (datetime.now() - timedelta(days=retention_days)).isoformat()
-    total = 0
-    while True:
-        with transaction() as connection:
-            rows = connection.execute(
-                "SELECT seq FROM events WHERE created_at < ? ORDER BY seq LIMIT ?",
-                (threshold, batch),
-            ).fetchall()
-            if not rows:
-                break
-            last_seq = rows[-1]["seq"]
-            cursor = connection.execute(
-                "DELETE FROM events WHERE seq <= ?", (last_seq,)
-            )
-            deleted = cursor.rowcount
-        total += deleted
-        if deleted < batch:
-            break
-    if total:
-        logger.info("Удалено старых событий: %d", total)
-    return total
 
 
 def stats() -> Dict[str, int]:

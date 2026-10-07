@@ -45,7 +45,7 @@ def find_open_email_ticket(subject: str) -> Optional[Ticket]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             "SELECT * FROM tickets WHERE source = 'email' "
-            "AND status IN ('new', 'taken') ORDER BY created_at DESC"
+            "AND status != 'closed' ORDER BY created_at DESC"
         ).fetchall()
     for row in rows:
         if normalize_email_subject(row["subject"]) == normalized_subject:

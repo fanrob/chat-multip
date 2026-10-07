@@ -62,10 +62,10 @@ def make_email_ticket(client, headers, ticket_id="t_mail01") -> str:
         connection.execute(
             """
             INSERT OR IGNORE INTO tickets
-                (id, source, client_id, client_name, text, status, taken_by, created_at,
+                (id, source, client_id, client_name, text, status, created_at,
                  message_id, subject)
             VALUES (?, 'email', 'ivan@mail.ru', 'Иван П.', 'Не могу пригнать машину',
-                    'new', NULL, ?, '<msg-1@mail>', 'Тема письма')
+                    'new', ?, '<msg-1@mail>', 'Тема письма')
             """,
             (ticket_id, now),
         )

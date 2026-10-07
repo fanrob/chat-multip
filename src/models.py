@@ -12,8 +12,6 @@ class Ticket:
     client_name: str
     text: str
     status: str = 'new'
-    # Legacy: мастеры больше не работают в Telegram, это поле не заполняется.
-    taken_by: Optional[int] = None
     created_at: datetime = None
     message_id: Optional[str] = None
     subject: str = ''

@@ -7,14 +7,13 @@ from config import settings_storage
 from bridge import record_client_message, record_ticket_closed, record_ticket_created
 from models import Ticket, generate_ticket_id
 from storage import (
-    ticket_storage, operator_message_storage, master_storage,
-    is_operator, get_operator_ids, is_admin, get_admin_id
+    ticket_storage, operator_message_storage, workshop_storage,
+    is_admin, get_admin_id, list_api_masters, workshop_has_masters, set_master_active
 )
 
 logger = logging.getLogger(__name__)
 
-# Глобальное хранилище заявок на роль мастера: {user_id: user_name}
-operator_requests = {}
+# Глобальное хранилище запросов на передачу прав администратора.
 admin_transfer_requests = {}
 
 
@@ -38,7 +37,7 @@ ALL_WORKSHOPS_BUTTON = "🌍 Отправить заявку для всех ц�
 
 def build_client_keyboard() -> ReplyKeyboardMarkup:
     """Клавиатура клиента: кнопки выбора цеха + отправка всем."""
-    workshops = master_storage.get_workshops()
+    workshops = workshop_storage.get_workshops()
     rows = [[KeyboardButton(w["name"])] for w in workshops]
     rows.append([KeyboardButton(ALL_WORKSHOPS_BUTTON)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
@@ -51,12 +50,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 Привет, администратор! Заявки клиентов вы получаете в приложении, "
             "здесь доступны управление мастерами и настройки.",
             reply_markup=build_admin_keyboard(),
-        )
-        return
-    if is_operator(update.effective_user.id):
-        await update.message.reply_text(
-            "👋 Привет, мастер! Заявки клиентов и ответы им доступны в приложении — "
-            "здесь можно запросить доступ администратора.",
         )
         return
     await update.message.reply_text(
@@ -88,14 +81,14 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
             await show_operator_list(update, context)
             return
         if update.message.text == "🗑 Удалить мастера":
-            await show_delete_operator_menu(update, context)
+            await show_manage_masters_menu(update, context)
             return
         if update.message.text == "👑 Панель администратора":
             await admin_panel(update, context)
             return
 
-    if is_operator(user.id) or is_admin(user.id):
-        # Мастера и админ работают с заявками в приложении, а не в боте.
+    if is_admin(user.id):
+        # Мастера работают с заявками в приложении, а не в боте.
         await update.message.reply_text(
             "ℹ️ Заявки и ответы клиентам доступны в приложении мастера. "
             "Здесь бот только принимает заявки от клиентов и ведёт админ-настройки."
@@ -131,7 +124,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    workshops = {w["name"]: w["id"] for w in master_storage.get_workshops()}
+    workshops = {w["name"]: w["id"] for w in workshop_storage.get_workshops()}
     if update.message.text in workshops:
         context.user_data["ticket_workshop_id"] = workshops[update.message.text]
         workshop_name = update.message.text
@@ -143,8 +136,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if open_ticket:
-        # Уточнение по открытой заявке. Проверять taken_by нельзя: мастер
-        # принимает заявку в приложении и это поле больше не заполняется.
+        # Уточнение по открытой заявке: мастер принимает её в приложении.
         record_client_message(
             open_ticket.id,
             open_ticket.client_name or str(user.id),
@@ -157,8 +149,8 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 
     workshop_id = context.user_data.get("ticket_workshop_id")
     if workshop_id is not None:
-        workshop_name = master_storage.get_workshop_name(workshop_id) or "выбранный цех"
-        if not get_operator_ids(workshop_id):
+        workshop_name = workshop_storage.get_workshop_name(workshop_id) or "выбранный цех"
+        if not workshop_has_masters(workshop_id):
             await update.message.reply_text(
                 f"⚠️ В цехе «{workshop_name}» пока нет мастеров. "
                 "Заявка не принята. Выберите другой цех или отправьте заявку для всех цехов."
@@ -178,7 +170,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
 
     close_markup = build_close_button(ticket.id)
     if workshop_id is not None:
-        workshop_name = master_storage.get_workshop_name(workshop_id) or "выбранный цех"
+        workshop_name = workshop_storage.get_workshop_name(workshop_id) or "выбранный цех"
         await update.message.reply_text(
             f"✅ Ваша заявка принята! Мастера цеха «{workshop_name}» скоро свяжутся с вами.",
             reply_markup=close_markup,
@@ -197,7 +189,7 @@ async def process_workshop_name_input(update: Update, context: ContextTypes.DEFA
     if not text:
         await update.message.reply_text("❌ Название не может быть пустым.")
         return
-    workshop_id = master_storage.add_workshop(text)
+    workshop_id = workshop_storage.add_workshop(text)
     context.user_data.pop('awaiting_workshop_name', None)
     await update.message.reply_text(
         f"🏭 Цех «{text}» добавлен (ID: {workshop_id}).",
@@ -335,45 +327,54 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_operator_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает администратору список активных мастеров."""
+    """Показывает администратору список мастеров (из приложения)."""
     if not is_admin(update.effective_user.id):
         return
 
-    operators = master_storage.all(include_deleted=False)
+    operators = list_api_masters(active_only=False)
     if not operators:
         text = "📭 Список мастеров пуст."
     else:
         lines = ["👥 Активные мастеры:"]
-        lines += [
-            f"• {row['full_name'] or 'без имени'} ({row['user_id']}) — 🏭 {row['workshop_name'] or 'без цеха'}"
-            for row in operators
-        ]
+        for row in operators:
+            status = "" if row["is_active"] else " — ⛔ отключён"
+            lines.append(
+                f"• {row['full_name'] or 'без имени'} ({row['master_uid']}) — "
+                f"🏭 {row['workshop_name'] or 'без цеха'}{status}"
+            )
         text = "\n".join(lines)
     await update.message.reply_text(text)
 
 
-async def show_delete_operator_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает администратору список мастеров для удаления."""
+async def show_manage_masters_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления мастерами (сообщением): отключить или включить мастера."""
     if not is_admin(update.effective_user.id):
         return
 
-    operators = master_storage.all(include_deleted=False)
-    if not operators:
-        await update.message.reply_text("📭 Нет мастеров для удаления.")
+    text, keyboard = build_manage_masters_menu()
+    if keyboard is None:
+        await update.message.reply_text("📭 Нет мастеров.", reply_markup=build_admin_keyboard())
         return
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    keyboard = [
-        [InlineKeyboardButton(
-            f"🗑 {row['full_name'] or row['user_id']} ({row['user_id']})",
-            callback_data=f"delete_op_{row['user_id']}"
-        )]
-        for row in operators
-    ]
+
+def build_manage_masters_menu():
+    """(текст, клавиатура) для меню управления мастерами. (None, None), если мастеров нет."""
+    operators = list_api_masters(active_only=False)
+    if not operators:
+        return None, None
+
+    keyboard = []
+    for row in operators:
+        if row["is_active"]:
+            label = f"🚫 Отключить {row['full_name'] or row['master_uid']}"
+            callback = f"disable_op_{row['master_uid']}"
+        else:
+            label = f"✅ Включить {row['full_name'] or row['master_uid']}"
+            callback = f"enable_op_{row['master_uid']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="adm_back")])
-    await update.message.reply_text(
-        "Выберите мастера для удаления:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    return "Управление мастерами (отключение/включение):", keyboard
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,87 +383,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data
-    
-    # Обработка заявок на роль мастера (доступно админу)
-    if data.startswith("approve_op_"):
-        if not is_admin(query.from_user.id):
-            await query.edit_message_text("⛔ Доступ только для администратора.")
-            return
-        
-        applicant_id = int(data.replace("approve_op_", ""))
-        applicant_name = operator_requests.get(applicant_id, "Неизвестный пользователь")
-        
-        # Показываем админу выбор цеха для нового мастера
-        workshops = master_storage.get_workshops()
-        keyboard = [
-            [InlineKeyboardButton(f"🏭 {w['name']}", callback_data=f"op_confirm_{applicant_id}:{w['id']}")]
-            for w in workshops
-        ]
-        keyboard.append([InlineKeyboardButton("🚫 Без цеха", callback_data=f"op_confirm_{applicant_id}:0")])
-        keyboard.append([InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_op_{applicant_id}")])
-
-        await query.edit_message_text(
-            f"Выберите цех для мастера **{applicant_name}** ({applicant_id}):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    if data.startswith("op_confirm_"):
-        if not is_admin(query.from_user.id):
-            await query.edit_message_text("⛔ Доступ только для администратора.")
-            return
-        
-        payload = data.replace("op_confirm_", "")
-        applicant_id_str, workshop_id_str = payload.split(":", 1)
-        applicant_id = int(applicant_id_str)
-        workshop_id = int(workshop_id_str) if workshop_id_str and workshop_id_str != "0" else None
-        applicant_name = operator_requests.get(applicant_id, "Неизвестный пользователь")
-        
-        master_storage.add(applicant_id, applicant_name, workshop_id)
-        
-        operator_requests.pop(applicant_id, None)
-        
-        workshop_name = master_storage.get_workshop_name(workshop_id)
-        workshop_text = f"🏭 Цех: {workshop_name}" if workshop_name else "🏭 Без цеха"
-        
-        await query.edit_message_text(
-            f"✅ Пользователь **{applicant_name}** ({applicant_id}) добавлен как мастер.\n{workshop_text}"
-        )
-        
-        # Уведомляем нового мастера
-        try:
-            await context.bot.send_message(
-                chat_id=applicant_id,
-                text="✅ Поздравляем! Вы добавлены как мастер.\n\n"
-                     "Заявки клиентов и ответы им доступны в приложении мастера.",
-            )
-        except Exception as e:
-            logger.error(f"Could not notify new operator {applicant_id}: {e}")
-        return
-
-    if data.startswith("reject_op_"):
-        if not is_admin(query.from_user.id):
-            await query.edit_message_text("⛔ Доступ только для администратора.")
-            return
-        
-        applicant_id = int(data.replace("reject_op_", ""))
-        applicant_name = operator_requests.get(applicant_id, "Неизвестный пользователь")
-        
-        await query.edit_message_text(f"❌ Заявка пользователя **{applicant_name}** ({applicant_id}) отклонена.")
-        
-        # Удаляем заявку из хранилища
-        operator_requests.pop(applicant_id, None)
-        
-        # Уведомляем об отказе
-        try:
-            await context.bot.send_message(
-                chat_id=applicant_id,
-                text="❌ К сожалению, ваша заявка на роль мастера была отклонена."
-            )
-        except Exception as e:
-            logger.error(f"Could not notify applicant {applicant_id}: {e}")
-        return
 
     if data.startswith("transfer_admin_"):
         if not is_admin(query.from_user.id):
@@ -513,7 +433,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "adm_wshop_delete":
-        workshops = master_storage.get_workshops()
+        workshops = workshop_storage.get_workshops()
         if not workshops:
             await query.edit_message_text("📭 Нет цехов для удаления.", reply_markup=build_admin_panel_keyboard())
             return
@@ -527,8 +447,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("del_wshop_"):
         workshop_id = int(data.replace("del_wshop_", ""))
-        workshop_name = master_storage.get_workshop_name(workshop_id) or str(workshop_id)
-        reset_count = master_storage.delete_workshop(workshop_id)
+        workshop_name = workshop_storage.get_workshop_name(workshop_id) or str(workshop_id)
+        reset_count = workshop_storage.delete_workshop(workshop_id)
         if reset_count == -1:
             await query.edit_message_text("❌ Цех не найден.", reply_markup=build_admin_panel_keyboard())
         else:
@@ -565,102 +485,60 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "adm_ops_list":
-        operators = master_storage.all(include_deleted=False)
+        operators = list_api_masters(active_only=False)
         if not operators:
             text = "📭 Список мастеров пуст."
         else:
-            lines = ["👥 Активные мастеры:"]
-            lines += [
-                f"• {row['full_name'] or 'без имени'} ({row['user_id']}) — 🏭 {row['workshop_name'] or 'без цеха'}"
-                for row in operators
-            ]
+            lines = ["👥 Мастеры:"]
+            for row in operators:
+                status = "" if row["is_active"] else " — ⛔ отключён"
+                lines.append(
+                    f"• {row['full_name'] or 'без имени'} ({row['master_uid']}) — "
+                    f"🏭 {row['workshop_name'] or 'без цеха'}{status}"
+                )
             text = "\n".join(lines)
         await query.edit_message_text(text, reply_markup=build_admin_panel_keyboard())
         return
 
     elif data == "adm_ops_delete":
-        operators = master_storage.all(include_deleted=False)
-        if not operators:
-            await query.edit_message_text("📭 Нет мастеров для удаления.", reply_markup=build_admin_panel_keyboard())
+        text, keyboard = build_manage_masters_menu()
+        if keyboard is None:
+            await query.edit_message_text("📭 Нет мастеров.", reply_markup=build_admin_panel_keyboard())
             return
-        keyboard = [
-            [InlineKeyboardButton(
-                f"🗑 {row['full_name'] or row['user_id']} ({row['user_id']})",
-                callback_data=f"delete_op_{row['user_id']}"
-            )]
-            for row in operators
-        ]
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="adm_back")])
-        await query.edit_message_text("Выберите мастера для удаления:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    elif data.startswith("delete_op_"):
-        target_id = int(data.replace("delete_op_", ""))
-        operator = master_storage.all(include_deleted=True)
-        operator_name = None
-        for op in operator:
-            if op['user_id'] == target_id:
-                operator_name = op['full_name'] or str(target_id)
-                break
-        
-        if master_storage.delete(target_id):
+    elif data.startswith("disable_op_"):
+        master_uid = data.replace("disable_op_", "")
+        if set_master_active(master_uid, False):
             await query.edit_message_text(
-                f"✅ мастер **{operator_name}** ({target_id}) удалён.",
-                reply_markup=build_admin_panel_keyboard(),
-                parse_mode='Markdown'
+                f"✅ Мастер {master_uid} отключён.", reply_markup=build_admin_panel_keyboard()
             )
         else:
-            await query.edit_message_text("❌ Ошибка при удалении мастера.", reply_markup=build_admin_panel_keyboard())
+            await query.edit_message_text(
+                "❌ Мастер не найден.", reply_markup=build_admin_panel_keyboard()
+            )
+        return
+
+    elif data.startswith("enable_op_"):
+        master_uid = data.replace("enable_op_", "")
+        if set_master_active(master_uid, True):
+            await query.edit_message_text(
+                f"✅ Мастер {master_uid} включён.", reply_markup=build_admin_panel_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Мастер не найден.", reply_markup=build_admin_panel_keyboard()
+            )
         return
 
     elif data == "adm_back":
         await query.edit_message_text("👑 Панель администратора:", reply_markup=build_admin_panel_keyboard())
 
 
-async def apply_operator_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /apply_operator — отправляет запрос администратору на добавление в мастеры."""
-    user_id = update.effective_user.id
-    user_name = update.effective_user.full_name or update.effective_user.username or str(user_id)
-    
-    # Проверяем, уже ли пользователь мастер
-    if is_operator(user_id):
-        await update.message.reply_text("ℹ️ Вы уже являетесь мастером.")
-        return
-    
-    # Создаем inline клавиатуру для админа
-    approve_btn = InlineKeyboardButton("✅ Принять", callback_data=f"approve_op_{user_id}")
-    reject_btn = InlineKeyboardButton("❌ Отказать", callback_data=f"reject_op_{user_id}")
-    keyboard = InlineKeyboardMarkup([[approve_btn, reject_btn]])
-    
-    # Сохраняем информацию о заявителе в глобальное хранилище
-    operator_requests[user_id] = user_name
-    
-    # Отправляем уведомление админу
-    notification_text = (
-        f"🔔 Новая заявка на роль мастера\n\n"
-        f"👤 Пользователь: {user_name}\n"
-        f"🆔 ID: {user_id}\n\n"
-        f"Принять или отклонить заявку?"
-    )
-    
-    try:
-        await context.bot.send_message(
-            chat_id=get_admin_id(),
-            text=notification_text,
-            reply_markup=keyboard,
-            parse_mode='Markdown'
-        )
-        await update.message.reply_text("✅ Ваша заявка отправлена администратору. Пожалуйста, ждите решения.")
-    except Exception as e:
-        logger.error(f"Error sending operator request to admin: {e}")
-        await update.message.reply_text(f"❌ Ошибка при отправке заявки: {e}")
-
-
 async def transfer_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создаёт запрос на передачу прав администратора текущему администратору."""
     user = update.effective_user
-    if not is_operator(user.id):
-        return
 
     if is_admin(user.id):
         return

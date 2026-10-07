@@ -12,10 +12,9 @@
 import logging
 import mimetypes
 import os
-import shutil
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import UploadFile
@@ -192,43 +191,6 @@ def _discard_file(path: str) -> None:
         logger.warning("Не удалось удалить временный файл %s", path)
 
 
-def save_from_channel(
-    ticket_id: str,
-    source_path: str,
-    filename: str,
-    mime: Optional[str] = None,
-    source: str = "client",
-    channel: str = "telegram",
-) -> str:
-    """Кладёт в хранилище файл, пришедший из мессенджера (Telegram/Viber).
-
-    Вызывается ботом: файл сначала скачан во временный файл, потом переносится
-    в наше хранилище под своим id. Возвращает attachment_id.
-    """
-    attachment_id = new_attachment_id()
-    resolved = _resolve_mime(filename, mime)
-    target = os.path.join(
-        storage_dir(), f"{attachment_id}{_extension(resolved, filename)}"
-    )
-    shutil.move(source_path, target)
-    size = os.path.getsize(target)
-    now = datetime.now().isoformat()
-
-    with transaction() as connection:
-        connection.execute(
-            """
-            INSERT INTO api_attachments
-                (id, ticket_id, message_id, source, channel, filename, mime_type,
-                 size_bytes, storage_key, created_at)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (attachment_id, ticket_id, source, channel, os.path.basename(filename)[:255],
-             resolved, size, target, now),
-        )
-
-    return attachment_id
-
-
 def get_meta(attachment_id: str) -> Optional[Dict[str, Any]]:
     with reading() as connection:
         row = connection.execute(
@@ -331,28 +293,6 @@ def resolve_for_delivery(attachment_id: str) -> Dict[str, Any]:
         "mime_type": row["mime_type"] or "application/octet-stream",
         "size": row["size_bytes"] or 0,
     }
-
-
-def attach_to_message(attachment_id: str, ticket_id: str, message_id: str) -> None:
-    with transaction() as connection:
-        connection.execute(
-            "UPDATE api_attachments SET message_id = ?, ticket_id = ? WHERE id = ?",
-            (message_id, ticket_id, attachment_id),
-        )
-
-
-def orphan_ids(older_than_hours: int = 24) -> list[str]:
-    """Вложения, загруженные, но так и не отправленные.
-
-    Их стоит удалять: пользователь передумал, а место на диске занято.
-    """
-    threshold = (datetime.now() - timedelta(hours=older_than_hours)).isoformat()
-    with reading() as connection:
-        rows = connection.execute(
-            "SELECT id FROM api_attachments WHERE message_id IS NULL AND created_at < ?",
-            (threshold,),
-        ).fetchall()
-    return [row["id"] for row in rows]
 
 
 def delete(attachment_id: str) -> bool:

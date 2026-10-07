@@ -69,10 +69,4 @@ async def deliver(bot, item: OutboxItem, ticket: Dict[str, Any]) -> None:
         _format_text(item.payload),
         list(item.payload.get("attachments") or []),
     )
-    operator_message_storage.add(
-        message_id,
-        client_id,
-        item.ticket_id,
-        sender="op",
-        text=item.payload.get("text") or "",
-    )
+    operator_message_storage.add(message_id, item.ticket_id)

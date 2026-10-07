@@ -58,6 +58,7 @@ def _server_time() -> str:
 
 def _profile(master: Master) -> Dict[str, Any]:
     from api.auth import workshop_name
+    from api.store import is_online
 
     return {
         "id": master.master_uid,
@@ -65,7 +66,7 @@ def _profile(master: Master) -> Dict[str, Any]:
         "workshop_id": store.workshop_id_to_api(master.workshop_id),
         "workshop_name": workshop_name(master.workshop_id),
         "is_active": master.is_active,
-        "online": True,
+        "online": is_online(master.last_seen_at),
     }
 
 
@@ -175,6 +176,7 @@ def patch_profile(
         workshop_id=store.workshop_id_to_db(data["workshop_id"]),
         is_active=master.is_active,
         created_at=master.created_at,
+        last_seen_at=master.last_seen_at,
     )
 
     return SessionResponse(
