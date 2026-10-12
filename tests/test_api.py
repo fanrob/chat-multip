@@ -267,6 +267,29 @@ def test_add_second_member(client, headers, second_headers):
     assert ticket.json()["ticket"]["owner"]["id"].startswith("m_")
 
 
+def test_owner_is_not_duplicated_in_members(client, headers, second_headers):
+    """Владелец приходит полем owner и не повторяется в members."""
+    ticket_id = seed_ticket(client, headers)
+    accepted = client.post(f"/v1/tickets/{ticket_id}/accept", headers=headers).json()
+    owner_id = accepted["ticket"]["owner"]["id"]
+
+    ticket = client.get(f"/v1/tickets/{ticket_id}", headers=headers).json()["ticket"]
+    assert ticket["members"] == []
+
+    masters = client.get("/v1/masters", headers=headers).json()["masters"]
+    other_id = next(m["id"] for m in masters if m["full_name"] == "Пётр Кузнецов")
+    client.post(
+        f"/v1/tickets/{ticket_id}/members", json={"master_id": other_id}, headers=headers
+    )
+
+    for hdrs in (headers, second_headers):
+        ticket = client.get(f"/v1/tickets/{ticket_id}", headers=hdrs).json()["ticket"]
+        member_ids = [m["master_id"] for m in ticket["members"]]
+        assert member_ids == [other_id]
+        assert owner_id not in member_ids
+        assert ticket["owner"]["id"] == owner_id
+
+
 def test_add_member_twice_returns_409(client, headers, second_headers):
     ticket_id = seed_ticket(client, headers)
     client.post(f"/v1/tickets/{ticket_id}/accept", headers=headers)

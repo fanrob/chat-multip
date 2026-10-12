@@ -228,7 +228,7 @@ def _hydrate_ticket(
 ) -> Dict[str, Any]:
     """Превращает строку tickets в структуру для ответа API."""
     ticket_id = row["id"]
-    members = _ticket_members(connection, ticket_id)
+    members = _ticket_members(connection, ticket_id, row["owner_uid"])
     last = _last_message(connection, ticket_id)
     unread = _unread_count(connection, ticket_id, master_uid)
 
@@ -271,7 +271,15 @@ def _hydrate_ticket(
     return data
 
 
-def _ticket_members(connection: sqlite3.Connection, ticket_id: str) -> List[Dict[str, Any]]:
+def _ticket_members(
+    connection: sqlite3.Connection, ticket_id: str, owner_uid: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Участники заявки сверх владельца.
+
+    Владелец хранится в ticket_members с ролью 'owner' (нужно для проверок),
+    но в API он приходит отдельно полем `ticket.owner` — иначе клиент,
+    склеивающий owner + members, показал бы его дважды.
+    """
     rows = connection.execute(
         """
         SELECT tm.master_uid, tm.role, tm.joined_at, m.full_name
@@ -290,6 +298,7 @@ def _ticket_members(connection: sqlite3.Connection, ticket_id: str) -> List[Dict
             "joined_at": row["joined_at"],
         }
         for row in rows
+        if row["master_uid"] != owner_uid
     ]
 
 

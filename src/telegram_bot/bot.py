@@ -16,14 +16,6 @@ logger = logging.getLogger(__name__)
 # Глобальное хранилище запросов на передачу прав администратора.
 admin_transfer_requests = {}
 
-
-def build_close_button(ticket_id: str) -> InlineKeyboardMarkup:
-    """Кнопка закрытия заявки клиентом."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("❌ Закрыть заявку", callback_data=f"close_client_{ticket_id}")]]
-    )
-
-
 def build_admin_keyboard() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура администратора."""
     return ReplyKeyboardMarkup(
@@ -168,12 +160,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
     ticket_storage.add(ticket)
     record_ticket_created(ticket.id)
 
-    close_markup = build_close_button(ticket.id)
     if workshop_id is not None:
         workshop_name = workshop_storage.get_workshop_name(workshop_id) or "выбранный цех"
         await update.message.reply_text(
-            f"✅ Ваша заявка принята! Мастера цеха «{workshop_name}» скоро свяжутся с вами.",
-            reply_markup=close_markup,
+            f"✅ Ваша заявка принята! Мастера цеха «{workshop_name}» скоро свяжутся с вами."
         )
     else:
         await update.message.reply_text("✅ Ваша заявка принята! Мастера скоро свяжутся с вами.", reply_markup=close_markup)
