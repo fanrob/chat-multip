@@ -5,5 +5,10 @@ __pycache__/
 
 
 *.db
+*.db-wal
+*.db-shm
 *.log
 *.cfg
+
+# Данные docker-compose (БД, вложения, логи) — рядом с проектом, не в git
+data/

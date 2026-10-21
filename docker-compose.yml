@@ -1,3 +1,30 @@
+# Три процесса — три контейнера из одного образа, общая папка ./data:
+#   api        HTTP API (python /app/src/api/app.py): накладывает миграции,
+#              создаёт full.db на пустом томе, отвечает healthcheck'ом;
+#   chat-multi telegram-бот (CMD образа): принимает заявки и разбирает
+#              очередь api_outbox (канал telegram);
+#   mail-bot   почтовый бот (IMAP/SMTP): разбирает api_outbox (канал email).
+# Боты стартуют только после здорового API — схема БД должна быть готова,
+# иначе консьюмеры упадут на отсутствующей таблице api_outbox.
+#
+# Данные (full.db, вложения, логи) лежат в ./data рядом с этим файлом и
+# переживают пересоздание контейнеров. На пустом томе базу создаёт API при
+# старте — вручную ничего инициализировать не нужно.
+#
+# Первый запуск с готовой базой: положите свой файл как ./data/full.db ДО
+# первого `docker compose up` — каталог смонтирован в /data, API увидит
+# существующий файл и не станет пересоздавать его, а миграции только
+# доложат недостающие таблицы/колонки, исходные данные сохранятся.
+# (Именованного тома в схеме больше нет: старый docker-том из проекта
+# сам по себе не подхватывает файлы папки — отсюда bind-mount ./data.)
+# Копируйте базу после остановки сервера либо вместе с файлами
+# full.db-wal и full.db-shm — иначе в WAL может остаться несданная запись.
+#
+# На Linux контейнеры работают от uid 1001 (appuser из Dockerfile): перед
+# первым запуском дайте папке права, иначе SQLite не сможет создать файл —
+#   mkdir -p data && sudo chown 1001:1001 data
+# На Windows/macOS Docker Desktop этого не требуется.
+
 services:
   # HTTP API для клиента Viber/Desktop. Живёт отдельным процессом: uvicorn и
   # telegram-бот несовместимы в одном процессе (оба хотят свой asyncio-цикл).
@@ -10,13 +37,14 @@ services:
     ports:
       - "21000:21000"
     volumes:
-      # Тот же том, что у бота: общие full.db и каталог вложений.
-      - chat_multi_data:/data
+      # Общая папка данных: тот же том монтируется у всех трёх сервисов.
+      - ./data:/data
       - ./secret.cfg:/data/secret.cfg:ro
     environment:
       - TZ=Europe/Moscow
       - CHAT_MULTI_DB=/data/full.db
       - CHAT_MULTI_ATTACHMENTS=/data/attachments
+      - SECRETS_FILE=/data/secret.cfg
       - CHAT_MULTI_API_HOST=0.0.0.0
       - CHAT_MULTI_API_PORT=21000
       - CHAT_MULTI_LOG_LEVEL=INFO
@@ -41,17 +69,21 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    # Данные (БД + логи) хранятся в именованном томе и переживают пересоздание контейнера
     volumes:
-      - chat_multi_data:/data
+      - ./data:/data
       # Файл секретов: создайте ./secret.cfg рядом с docker-compose.yml
       # (см. secrets.txt.example — формат KEY=VALUE, ключи bot_token, admin_id, email, email_password)
       - ./secret.cfg:/data/secret.cfg:ro
     environment:
       - TZ=Europe/Moscow
+      # Пути дублируем явно: без них бот возьмёт "full.db" относительно
+      # WORKDIR и молча создаст вторую, ни с чем не связанную базу.
+      - CHAT_MULTI_DB=/data/full.db
+      - CHAT_MULTI_ATTACHMENTS=/data/attachments
+      - SECRETS_FILE=/data/secret.cfg
 
   # Почтовый бот: чтение IMAP и отправка ответов клиентам по SMTP. Отдельный
-  # процесс от Telegram-бота, общий том данных и тот же секрет с почтовым паролем.
+  # процесс от Telegram-бота, общая папка данных и тот же секрет с почтовым паролем.
   mail-bot:
     build: .
     container_name: chat-multi-mail
@@ -63,10 +95,10 @@ services:
       api:
         condition: service_healthy
     volumes:
-      - chat_multi_data:/data
+      - ./data:/data
       - ./secret.cfg:/data/secret.cfg:ro
     environment:
       - TZ=Europe/Moscow
-
-volumes:
-  chat_multi_data:
+      - CHAT_MULTI_DB=/data/full.db
+      - CHAT_MULTI_ATTACHMENTS=/data/attachments
+      - SECRETS_FILE=/data/secret.cfg
