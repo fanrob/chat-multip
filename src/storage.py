@@ -280,3 +280,16 @@ def set_master_active(master_uid: str, active: bool) -> bool:
             (value, master_uid, value),
         )
     return cursor.rowcount > 0
+
+
+def get_api_master(master_uid: str):
+    """Карточка мастера для админ-действий (с названием цеха). None, если не найден."""
+    with sqlite3.connect(workshop_storage.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            "SELECT m.master_uid, m.instance_id, m.full_name, m.workshop_id, "
+            "m.is_active, w.name AS workshop_name "
+            "FROM api_masters m LEFT JOIN workshops w ON m.workshop_id = w.id "
+            "WHERE m.master_uid = ?",
+            (master_uid,),
+        ).fetchone()

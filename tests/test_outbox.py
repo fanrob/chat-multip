@@ -49,9 +49,11 @@ class FakeBot:
 
     def __init__(self) -> None:
         self.calls = []
+        self.message_kwargs = []
 
     async def send_message(self, chat_id, text, **kwargs):
         self.calls.append(("message", chat_id, text))
+        self.message_kwargs.append(kwargs)
         return types.SimpleNamespace(message_id=4242)
 
     async def send_photo(self, chat_id, photo, **kwargs):
@@ -68,7 +70,7 @@ def master_of(headers):
     """Объект мастера по тем же заголовкам, что использует API."""
     from api import auth
 
-    return auth.get_or_create(headers[auth.HEADER_NAME], "Фёдор Семёнов", None)
+    return auth.register(headers[auth.HEADER_NAME], "Фёдор Семёнов", None)[0]
 
 
 def _clear_operator_messages(db_path: str) -> None:
@@ -435,6 +437,55 @@ def test_notify_channel_is_separate_from_master_replies(client, headers):
     assert notify_rows(ticket_id)[0]["status"] == "pending", "уведомление ждёт своего цикла"
     item = claim_next(CHANNEL_TELEGRAM)
     assert item.message_id == message["id"], "цикл ответов забирает только ответы мастера"
+
+
+# ==================== Уведомление администратору (вход мастера) ====================
+
+
+def queue_join_request(instance_id: str, full_name: str = "Фёдор Семёнов"):
+    """Регистрирует мастера вне белого списка: уходит уведомление админу."""
+    from api import auth
+    from api.db import transaction
+
+    with transaction() as connection:
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('api_instance_allowlist', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(uuid.uuid4()),),
+        )
+    return auth.register(instance_id, full_name, None)
+
+
+def test_admin_join_notification_sent_without_ticket(client):
+    """Уведомление о просителе входа уходит админу, а не клиенту заявки."""
+    from storage import get_admin_id
+
+    instance = str(uuid.uuid4())
+    master, status = queue_join_request(instance)
+    assert status == "pending"
+
+    bot = FakeBot()
+    assert asyncio.run(process_one(CHANNEL_TELEGRAM_NOTIFY, telegram_out(bot))) is True
+
+    assert len(bot.calls) == 1
+    kind, chat_id, text = bot.calls[0]
+    assert kind == "message"
+    assert chat_id == get_admin_id(), "адресат — admin_id из settings"
+    assert "Фёдор Семёнов" in text
+    assert instance in text
+
+    keyboard = bot.message_kwargs[-1]["reply_markup"]
+    callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    assert callbacks == [f"join_approve:{master.master_uid}", f"join_decline:{master.master_uid}"]
+
+
+def test_admin_join_notification_not_claimed_by_ticket_channels(client):
+    """Строка админу лежит только в канале *_notify, остальные её не видят."""
+    queue_join_request(str(uuid.uuid4()))
+
+    assert pending_count(CHANNEL_TELEGRAM) == 0
+    assert peek_next(CHANNEL_TELEGRAM) is None
+    assert peek_next(CHANNEL_TELEGRAM_NOTIFY) is not None
 
 
 if __name__ == "__main__":  # pragma: no cover

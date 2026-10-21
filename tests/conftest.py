@@ -85,7 +85,7 @@ def headers() -> dict:
     instance = make_instance()
     from api import auth
 
-    auth.get_or_create(instance, "Фёдор Семёнов", None)
+    auth.register(instance, "Фёдор Семёнов", None)
     return {auth.HEADER_NAME: instance}
 
 
@@ -95,7 +95,7 @@ def second_headers() -> dict:
     instance = make_instance()
     from api import auth
 
-    auth.get_or_create(instance, "Пётр Кузнецов", None)
+    auth.register(instance, "Пётр Кузнецов", None)
     return {auth.HEADER_NAME: instance}
 
 

@@ -111,14 +111,14 @@ def create_session(payload: SessionCreate) -> SessionResponse:
     Первый запрос, поэтому instance_id приходит в теле, а не в заголовке.
     Идемпотентно: повторный вызов с тем же instance_id не создаёт второго
     мастера, а обновляет профиль.
+
+    Если белый список заполнен и id в него не попал, мастер записывается
+    неактивным, администратор получает уведомление в Telegram, а клиенту
+    отдаётся 403 — до подтверждения сервер для него закрыт.
     """
-    from api.auth import get_or_create, is_allowed, normalize_instance_id
+    from api.auth import normalize_instance_id, register
 
     instance_id = normalize_instance_id(payload.instance_id)
-
-    if not is_allowed(instance_id):
-        logger.warning("POST /session отклонён: %s не в белом списке", instance_id)
-        raise errors.instance_not_whitelisted()
 
     workshop_db = store.workshop_id_to_db(payload.workshop_id)
     if workshop_db is not None:
@@ -131,7 +131,9 @@ def create_session(payload: SessionCreate) -> SessionResponse:
                 "Цех не найден", workshop_id=payload.workshop_id
             )
 
-    master = get_or_create(instance_id, payload.full_name, workshop_db)
+    master, status = register(instance_id, payload.full_name, workshop_db)
+    if status == "pending":
+        raise errors.instance_not_whitelisted()
 
     return SessionResponse(
         master_id=master.master_uid,

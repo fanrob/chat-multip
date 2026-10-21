@@ -57,7 +57,8 @@ def instance_not_whitelisted() -> ApiError:
     return ApiError(
         status.HTTP_403_FORBIDDEN,
         "instance_not_whitelisted",
-        "Экземпляр не добавлен в белый список. Обратитесь к администратору.",
+        "Экземпляр не добавлен в белый список. Запрос отправлен "
+        "администратору — дождитесь подтверждения и повторите вход.",
     )
 
 

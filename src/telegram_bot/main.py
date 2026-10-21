@@ -80,7 +80,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("transfer_admin", transfer_admin))   #TODO переделать алгоритм, чтобы любомы можно было отправить запрос на админство
 
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^(adm_|disable_op_|enable_op_|transfer_admin_|del_wshop_)'))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^(adm_|disable_op_|enable_op_|transfer_admin_|del_wshop_|join_)'))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
     # Фото клиента (в том числе с подписью): принимаем в заявку и отдаём через API.

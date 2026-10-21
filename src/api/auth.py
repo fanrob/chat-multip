@@ -8,18 +8,24 @@
 в Viber или в Telegram — uid останется тем же, и переписка не распадётся на
 несколько историй.
 
-Белый список: без интернета и TLS защита условная, поэтому дополнительно
-проверяем instance_id по списку в settings. Если списка нет — принимаем
-любой валидный UUID (режим первого запуска), но пишем в лог.
+Белый список и отложенная активация: без интернета и TLS защита условная,
+поэтому instance_id проверяется по списку в settings (ключ
+api_instance_allowlist, через запятую). Пустой список — режим первого
+запуска, входим сразу. Если список заполнен и id в него не попал, мастер
+всё равно записывается в БД, но неактивным (is_active=0): администратор
+получает уведомление в Telegram с кнопками «Принять/Отказать», а клиент
+до подтверждения получает 403 — как и раньше. Администратор может
+подтвердить кнопкой в уведомлении или через панель управления мастерами.
 """
 
+import json
 import logging
 import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from fastapi import Depends, Header
 
@@ -36,7 +42,18 @@ UUID_RE = re.compile(
 #: Ключ в settings со списком разрешённых instance_id (через запятую).
 ALLOWLIST_KEY = "api_instance_allowlist"
 
+#: Канал api_outbox для уведомлений администратору. Соответствует
+#: outbox_queue.CHANNEL_TELEGRAM_NOTIFY: уведомление не должно вклиниваться
+#: в FIFO-очередь ответов мастера клиенту.
+ADMIN_NOTIFY_CHANNEL = "telegram_notify"
+
 HEADER_NAME = "X-Instance-Id"
+
+#: Статусы register(): 'registered' — вход разрешён (мастер может быть
+#: отключён администратором, это видно по profile.is_active), 'pending' —
+#: ждёт подтверждения администратора, клиенту отдан 403.
+STATUS_REGISTERED = "registered"
+STATUS_PENDING = "pending"
 
 
 @dataclass(frozen=True)
@@ -128,45 +145,114 @@ def find_by_instance(instance_id: str) -> Optional[Master]:
     return Master.from_row(row) if row else None
 
 
-def get_or_create(instance_id: str, full_name: str, workshop_id: Optional[int]) -> Master:
-    """Регистрирует мастера или обновляет его профиль.
+def register(instance_id: str, full_name: str, workshop_id: Optional[int]) -> Tuple[Master, str]:
+    """Регистрирует мастера или обновляет его профиль. Вызывается из POST /session.
 
-    Вызывается из POST /session. Если ФИО или цех не переданы, старые значения
-    сохраняются — иначе клиент, который шлёт только instance_id, стёр бы данные.
+    Возвращает (мастер, статус). Статус STATUS_PENDING — id не в белом
+    списке: мастер записан неактивным, администратору ушло уведомление в
+    очередь, клиенту routes отдаёт 403.
+
+    Если ФИО или цех не переданы, старые значения сохраняются — иначе
+    клиент, который шлёт только instance_id, стёр бы данные.
     """
     now = _now()
     with transaction() as connection:
         row = connection.execute(
             "SELECT * FROM api_masters WHERE instance_id = ?", (instance_id,)
         ).fetchone()
+        allowed_ids = allowlist()
 
         if row is None:
+            whitelisted = not allowed_ids or instance_id in allowed_ids
             master_uid = new_master_uid()
             connection.execute(
                 """
                 INSERT INTO api_masters
                     (master_uid, instance_id, full_name, workshop_id,
                      is_active, created_at, last_seen_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (master_uid, instance_id, full_name, workshop_id, now, now),
+                (master_uid, instance_id, full_name, workshop_id,
+                 1 if whitelisted else 0, now, now),
             )
-            logger.info("Новый мастер %s (%s)", master_uid, full_name or "без имени")
+            if whitelisted:
+                logger.info("Новый мастер %s (%s)", master_uid, full_name or "без имени")
+                status = STATUS_REGISTERED
+            else:
+                logger.info(
+                    "Новый мастер %s (%s) ждёт подтверждения: %s не в белом списке",
+                    master_uid, full_name or "без имени", instance_id,
+                )
+                _enqueue_join_request(connection, master_uid, instance_id, full_name, workshop_id)
+                status = STATUS_PENDING
         else:
             master_uid = row["master_uid"]
             name = full_name.strip() or row["full_name"]
             workshop = workshop_id if workshop_id is not None else row["workshop_id"]
+            is_active = bool(row["is_active"])
+            if not is_active and allowed_ids and instance_id in allowed_ids:
+                # Явное попадание в белый список — админ разрешил вход вручную.
+                is_active = True
             connection.execute(
-                "UPDATE api_masters SET full_name = ?, workshop_id = ?, last_seen_at = ? "
+                "UPDATE api_masters SET full_name = ?, workshop_id = ?, is_active = ?, last_seen_at = ? "
                 "WHERE master_uid = ?",
-                (name, workshop, now, master_uid),
+                (name, workshop, int(is_active), now, master_uid),
             )
+            if is_active:
+                status = STATUS_REGISTERED
+            elif allowed_ids:
+                # Список заполнен, id в нём нет — ждём подтверждения.
+                # Уведомление уже уходило при создании, повтор не шлём.
+                status = STATUS_PENDING
+            else:
+                # Открытый режим: админ отключил мастера — оставляем
+                # отключённым, но вход формально разрешён (как раньше:
+                # 200 с is_active=false, остальные запросы 403).
+                status = STATUS_REGISTERED
 
         fresh = connection.execute(
             "SELECT * FROM api_masters WHERE master_uid = ?", (master_uid,)
         ).fetchone()
 
-    return Master.from_row(fresh)
+    return Master.from_row(fresh), status
+
+
+def _enqueue_join_request(
+    connection: sqlite3.Connection,
+    master_uid: str,
+    instance_id: str,
+    full_name: str,
+    workshop_id: Optional[int],
+) -> None:
+    """Кладёт администратору уведомление о новом мастере, ждущем входа.
+
+    Вызывается внутри той же транзакции, что создаёт мастера: фантомного
+    «просителя» без уведомления не будет. Доставку выполняет процесс бота
+    (outbox-консьюмер канала telegram_notify), кнопки Принять/Отказать
+    обрабатывает telegram_bot.bot.admin_callback.
+    """
+    lines = ["🔔 Новый мастер просит доступ к серверу.", ""]
+    lines.append(f"ФИО: {full_name.strip() or 'не указано'}")
+    lines.append(f"Цех: {workshop_name(workshop_id) or 'не указан'}")
+    lines.append(f"instance_id: {instance_id}")
+    payload = {
+        "system": True,
+        "target": "admin",
+        "text": "\n".join(lines),
+        "master_uid": master_uid,
+        "instance_id": instance_id,
+        "buttons": [
+            {"text": "✅ Принять", "callback_data": f"join_approve:{master_uid}"},
+            {"text": "❌ Отказать", "callback_data": f"join_decline:{master_uid}"},
+        ],
+    }
+    connection.execute(
+        """
+        INSERT INTO api_outbox (ticket_id, message_id, channel, payload, status, created_at)
+        VALUES ('', '', ?, ?, 'pending', ?)
+        """,
+        (ADMIN_NOTIFY_CHANNEL, json.dumps(payload, ensure_ascii=False), _now()),
+    )
 
 
 def touch(master_uid: str) -> None:
@@ -202,14 +288,15 @@ async def current_master(
     """FastAPI-зависимость: возвращает мастера по X-Instance-Id.
 
     401 — заголовка нет или он не UUID.
-    403 — instance_id не в белом списке либо мастер отключён.
     404 — мастер ещё не проходил POST /session.
+    403 — мастер ждёт подтверждения (instance_not_whitelisted) либо
+    отключён администратором (forbidden).
+
+    Белый список здесь не проверяется: он отсекает новых клиентов на
+    POST /session, а уже активный мастер работает, даже если его id
+    админ не вписал в список вручную.
     """
     instance_id = normalize_instance_id(x_instance_id)
-
-    if not is_allowed(instance_id):
-        logger.warning("Отклонён instance_id %s (нет в белом списке)", instance_id)
-        raise errors.instance_not_whitelisted()
 
     master = find_by_instance(instance_id)
     if master is None:
@@ -219,7 +306,10 @@ async def current_master(
             "Мастер не найден. Сначала выполните POST /v1/session.",
         )
     if not master.is_active:
-        raise errors.forbidden("Доступ мастера отключён")
+        if not is_allowed(instance_id):
+            logger.debug("Запрос от неподтверждённого instance_id %s", instance_id)
+            raise errors.instance_not_whitelisted()
+        raise errors.forbidden("Доступ мастера отключён администратором")
 
     touch(master.master_uid)
     return master

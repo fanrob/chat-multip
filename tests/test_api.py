@@ -924,3 +924,162 @@ def json_dumps(value) -> str:
     import json
 
     return json.dumps(value, ensure_ascii=False)
+
+
+# ==================== Отложенная активация ====================
+
+
+def set_allowlist(*instance_ids: str) -> None:
+    """Заполняет белый список (непустой список включает «режим одобрений»)."""
+    from api.db import transaction
+
+    with transaction() as connection:
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('api_instance_allowlist', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (",".join(instance_ids),),
+        )
+
+
+def master_row(instance_id: str):
+    from api.db import reading
+
+    with reading() as connection:
+        return connection.execute(
+            "SELECT * FROM api_masters WHERE instance_id = ?", (instance_id,)
+        ).fetchone()
+
+
+def admin_notify_rows() -> list:
+    """Уведомления администратору в очереди (ticket_id пустой — не заявка)."""
+    from api.db import reading
+    from outbox_queue import CHANNEL_TELEGRAM_NOTIFY
+
+    with reading() as connection:
+        return connection.execute(
+            "SELECT * FROM api_outbox WHERE channel = ? AND ticket_id = '' ORDER BY id",
+            (CHANNEL_TELEGRAM_NOTIFY,),
+        ).fetchall()
+
+
+def test_new_instance_waits_for_approval_when_not_whitelisted(client, instance_id):
+    """id вне белого списка: запись есть, но неактивна; клиенту — 403."""
+    import json
+
+    set_allowlist(str(uuid.uuid4()))
+
+    response = client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор Семёнов"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "instance_not_whitelisted"
+
+    row = master_row(instance_id)
+    assert row is not None, "запрос должен записаться в БД, даже если вход закрыт"
+    assert row["is_active"] == 0
+    assert row["full_name"] == "Фёдор Семёнов"
+
+    rows = admin_notify_rows()
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["target"] == "admin"
+    assert payload["system"] is True
+    assert "Фёдор Семёнов" in payload["text"]
+    assert instance_id in payload["text"]
+    assert payload["buttons"][0]["callback_data"] == f"join_approve:{row['master_uid']}"
+    assert payload["buttons"][1]["callback_data"] == f"join_decline:{row['master_uid']}"
+
+
+def test_pending_retry_does_not_duplicate_notification(client, instance_id):
+    """Клиент повторяет вход — админу не шлём второе уведомление."""
+    set_allowlist(str(uuid.uuid4()))
+
+    for _ in range(3):
+        response = client.post(
+            "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+        )
+        assert response.status_code == 403
+
+    assert len(admin_notify_rows()) == 1
+
+
+def test_approved_master_can_login(client, instance_id):
+    """Админ нажал «Принять» — клиент проходит на сервер."""
+    from storage import set_master_active
+
+    set_allowlist(str(uuid.uuid4()))
+    client.post("/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"})
+
+    set_master_active(master_row(instance_id)["master_uid"], True)
+
+    response = client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["profile"]["is_active"] is True
+
+    tickets = client.get("/v1/tickets", headers={"X-Instance-Id": instance_id})
+    assert tickets.status_code == 200
+
+
+def test_whitelisted_instance_registers_immediately(client, instance_id):
+    """id в белом списке входит без ожидания и без уведомлений."""
+    set_allowlist(instance_id)
+
+    response = client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["profile"]["is_active"] is True
+    assert admin_notify_rows() == []
+
+
+def test_pending_master_is_rejected_on_other_endpoints(client, instance_id):
+    """До подтверждения сервер для клиента закрыт целиком."""
+    set_allowlist(str(uuid.uuid4()))
+    client.post("/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"})
+    headers = {"X-Instance-Id": instance_id}
+
+    for path in ("/v1/session", "/v1/tickets", "/v1/masters"):
+        response = client.get(path, headers=headers)
+        assert response.status_code == 403, path
+        assert response.json()["error"]["code"] == "instance_not_whitelisted", path
+
+
+def test_active_master_works_even_without_allowlist_entry(client, instance_id):
+    """Белый список отсекает новых, но не отключает уже активных мастеров."""
+    headers = {"X-Instance-Id": instance_id}
+    assert client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    ).status_code == 200
+
+    set_allowlist(str(uuid.uuid4()))
+
+    assert client.get("/v1/tickets", headers=headers).status_code == 200
+    assert client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    ).status_code == 200
+
+
+def test_disabled_master_session_keeps_old_behaviour(client, instance_id):
+    """Отключённого админом мастера вход не поднимает, остальные запросы 403."""
+    from storage import set_master_active
+
+    headers = {"X-Instance-Id": instance_id}
+    master_id = client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    ).json()["master_id"]
+    set_master_active(master_id, False)
+
+    response = client.post(
+        "/v1/session", json={"instance_id": instance_id, "full_name": "Фёдор"}
+    )
+    assert response.status_code == 200
+    assert response.json()["profile"]["is_active"] is False
+
+    denied = client.get("/v1/tickets", headers=headers)
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "forbidden"

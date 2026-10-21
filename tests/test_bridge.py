@@ -420,7 +420,7 @@ def test_ticket_closed_for_unknown_id_is_noop(client, headers):
 
 
 def _master(headers: dict):
-    return auth.get_or_create(headers[auth.HEADER_NAME], "Фёдор Семёнов", None)
+    return auth.register(headers[auth.HEADER_NAME], "Фёдор Семёнов", None)[0]
 
 
 if __name__ == "__main__":  # pragma: no cover

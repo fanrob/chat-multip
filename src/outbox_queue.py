@@ -59,8 +59,9 @@ DELIVERY_SENDING = "sending"
 DELIVERY_SENT = "sent"
 DELIVERY_FAILED = "failed"
 
-#: Что умеет доставить канал: получает строку очереди и данные заявки.
-Deliverer = Callable[["OutboxItem", Dict[str, Any]], Awaitable[None]]
+#: Что умеет доставить канал: получает строку очереди и данные заявки
+#: (None — уведомление администратору, к заявке не привязано).
+Deliverer = Callable[["OutboxItem", Optional[Dict[str, Any]]], Awaitable[None]]
 
 
 class OutboxItem:
@@ -256,6 +257,15 @@ def pending_count(channel: str) -> int:
     return row["n"]
 
 
+def is_admin_message(item: OutboxItem) -> bool:
+    """Уведомление администратору (например, о мастере, просящем вход).
+
+    Такие строки не привязаны к заявке: ticket_id в них пустой, адресат —
+    админ из settings.admin_id, а payload несёт кнопки действий.
+    """
+    return item.payload.get("target") == "admin"
+
+
 async def process_one(channel: str, deliver: Deliverer) -> bool:
     """Отправляет одно сообщение канала. True — было что отправлять."""
     item = claim_next(channel)
@@ -263,7 +273,7 @@ async def process_one(channel: str, deliver: Deliverer) -> bool:
         return False
 
     ticket = load_ticket(item.ticket_id)
-    if ticket is None:
+    if ticket is None and not is_admin_message(item):
         mark_permanently_failed(item, "Заявка не найдена")
         return True
 

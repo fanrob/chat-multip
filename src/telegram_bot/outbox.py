@@ -11,11 +11,13 @@
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from api import attachments as attachments_service
-from outbox_queue import OutboxItem
-from storage import operator_message_storage
+from outbox_queue import OutboxItem, is_admin_message
+from storage import get_admin_id, operator_message_storage
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +68,38 @@ async def _deliver_file(bot, chat_id: int, resolved: Dict[str, Any], reply_to: i
         )
 
 
-async def deliver(bot, item: OutboxItem, ticket: Dict[str, Any]) -> None:
-    """Отправляет сообщение клиенту в Telegram."""
+async def _deliver_admin(bot, item: OutboxItem) -> None:
+    """Отправляет уведомление администратору (мастер, просящий вход).
+
+    Адресат — admin_id из settings, а не клиент заявки: такие строки в
+    очереди к заявкам не привязаны. Кнопки (Принять/Отказать) приходят
+    в payload — бот их только переносит в клавиатуру, а обрабатывает
+    telegram_bot.bot.admin_callback.
+    """
+    payload = item.payload
+    keyboard = None
+    buttons = payload.get("buttons") or []
+    if buttons:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(b["text"], callback_data=b["callback_data"])]
+                for b in buttons
+            ]
+        )
+    await bot.send_message(
+        chat_id=get_admin_id(),
+        text=payload.get("text") or "🔔 Новое уведомление для администратора.",
+        reply_markup=keyboard,
+    )
+
+
+async def deliver(
+    bot, item: OutboxItem, ticket: Optional[Dict[str, Any]]
+) -> None:
+    """Отправляет сообщение клиенту в Telegram (или админу, если это уведомление)."""
+    if is_admin_message(item):
+        await _deliver_admin(bot, item)
+        return
     client_id = int(ticket["client_id"])
     message_id = await _send_telegram(
         bot,

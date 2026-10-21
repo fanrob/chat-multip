@@ -8,7 +8,8 @@ from bridge import record_client_message, record_ticket_closed, record_ticket_cr
 from models import Ticket, generate_ticket_id
 from storage import (
     ticket_storage, operator_message_storage, workshop_storage,
-    is_admin, get_admin_id, list_api_masters, workshop_has_masters, set_master_active
+    is_admin, get_admin_id, get_api_master, list_api_masters,
+    workshop_has_masters, set_master_active
 )
 
 logger = logging.getLogger(__name__)
@@ -453,6 +454,27 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(query.from_user.id):
         await query.edit_message_text("⛔ Доступ только для администратора.")
+        return
+
+    # Заявка на вход мастера (уведомление из api_outbox, канал telegram_notify).
+    if data.startswith(("join_approve:", "join_decline:")):
+        action, master_uid = data.split(":", 1)
+        master = get_api_master(master_uid)
+        if not master:
+            await query.edit_message_text("❗ Мастер не найден.")
+            return
+        name = master["full_name"] or master_uid
+        if action == "join_approve":
+            set_master_active(master_uid, True)
+            await query.edit_message_text(
+                f"✅ Мастер {name} принят. Приложение получит доступ "
+                "при следующей попытке входа."
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Запрос мастера {name} отклонён. Он останется "
+                "отключённым — включить можно в панели администратора."
+            )
         return
 
     if data == "adm_wshop_add":
