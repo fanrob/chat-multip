@@ -14,6 +14,7 @@ from conftest import seed_ticket
 from test_outbox import (
     _clear_operator_messages,
     delivery_of,
+    master_of,
     outbox_status,
     queue_message,
 )
@@ -22,6 +23,7 @@ from api.db import reading, transaction
 from mail_bot import outbox as mail_outbox
 from outbox_queue import (
     CHANNEL_EMAIL,
+    CHANNEL_EMAIL_NOTIFY,
     CHANNEL_TELEGRAM,
     DELIVERY_FAILED,
     DELIVERY_SENT,
@@ -181,6 +183,27 @@ def test_mail_recover_stale_does_not_touch_telegram(client, headers):
     assert recover_stale(CHANNEL_EMAIL) == 1
     assert outbox_status(email_message["id"]) == "pending"
     assert outbox_status(tg_message["id"]) == "sending", "чужой канал не трогаем"
+
+
+def test_email_accept_notification_goes_to_email_channel(client, headers, sent):
+    """Клиента о принятии уведомляют письмом — по своему каналу уведомлений."""
+    from api import store
+
+    ticket_id = make_email_ticket(client, headers)
+    store.accept_ticket(master_of(headers), ticket_id)
+
+    with reading() as connection:
+        row = connection.execute(
+            "SELECT channel FROM api_outbox WHERE ticket_id = ? AND channel = ?",
+            (ticket_id, CHANNEL_EMAIL_NOTIFY),
+        ).fetchone()
+    assert row is not None, "уведомление для email-заявки идёт в email_notify"
+
+    assert asyncio.run(process_one(CHANNEL_EMAIL_NOTIFY, mail_outbox.deliver)) is True
+
+    assert len(sent) == 1
+    assert sent[0]["to"] == "ivan@mail.ru"
+    assert "принял мастер" in sent[0]["text"]
 
 
 if __name__ == "__main__":  # pragma: no cover

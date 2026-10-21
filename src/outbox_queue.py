@@ -30,13 +30,19 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from api import events
 from api.db import reading, transaction
-from api.store import members_with_owner
+from api.store import NOTIFY_CHANNEL_SUFFIX, members_with_owner
 
 logger = logging.getLogger(__name__)
 
 #: Каналы доставки: строки с другим channel этому процессу не принадлежат.
 CHANNEL_TELEGRAM = "telegram"
 CHANNEL_EMAIL = "email"
+
+#: Отдельные каналы для системных уведомлений клиенту. Их обслуживает тот же
+#: процесс, что и ответы мастера, но отдельным циклом: порядок и пауза между
+#: ответами мастера не должны зависеть от уведомлений.
+CHANNEL_TELEGRAM_NOTIFY = CHANNEL_TELEGRAM + NOTIFY_CHANNEL_SUFFIX
+CHANNEL_EMAIL_NOTIFY = CHANNEL_EMAIL + NOTIFY_CHANNEL_SUFFIX
 
 #: Как долго ждать между опросами очереди, секунды.
 POLL_INTERVAL_SECONDS = 1.0
@@ -154,7 +160,13 @@ def _notify(
     delivery: str,
     read_at: Optional[str],
 ) -> None:
-    """Сообщает участникам заявки о смене статуса доставки."""
+    """Сообщает участникам заявки о смене статуса доставки.
+
+    У системного уведомления строки в `messages` нет (message_id пуст) —
+    сообщать о смене его статуса доставки некому и нечем.
+    """
+    if not message_id:
+        return
     recipients = set(members_with_owner(connection, ticket_id))
     events.emit(
         connection,

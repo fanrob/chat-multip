@@ -54,6 +54,13 @@ def master_uid_of(headers: dict) -> str:
         ).fetchone()["master_uid"]
 
 
+def attachments_of(ticket_id: str) -> list:
+    with reading() as connection:
+        return connection.execute(
+            "SELECT * FROM api_attachments WHERE ticket_id = ? ORDER BY created_at", (ticket_id,)
+        ).fetchall()
+
+
 # ==================== Заявка из Telegram ====================
 
 
@@ -114,6 +121,57 @@ def test_client_message_lands_in_history(client, headers):
 
     types = [e["type"] for e in events_of(master_uid_of(headers), ticket_id)]
     assert "message.created" in types
+
+
+def test_client_message_on_feed_ticket_reaches_masters(client, headers, second_headers):
+    """Заявка ещё в ленте: сообщение клиента видят все, кому видна заявка.
+
+    Иначе мастер получит переписку не полностью: приняв заявку, он покажет
+    только вводный текст из карточки, а сообщения, пришедшие до принятия,
+    пропадут — клиент кэширует историю по событиям message.created.
+    """
+    ticket_id = seed_ticket(client, headers)  # status='new', без участников
+
+    message = record_client_message(
+        ticket_id, "Иван П.", "И ещё вопрос", chat_id=CHAT_ID, message_id=9008
+    )
+
+    assert message is not None
+    for master_headers in (headers, second_headers):
+        types = [e["type"] for e in events_of(master_uid_of(master_headers), ticket_id)]
+        assert "message.created" in types, "сообщение до принятия должно дойти до ленты мастера"
+
+
+def test_client_message_on_feed_ticket_skips_declined_master(
+    client, headers, second_headers
+):
+    """Скрытая мастером заявка не должна слать ему события и по переписке."""
+    ticket_id = seed_ticket(client, headers)
+    store.decline_ticket(_master(second_headers), ticket_id)
+
+    record_client_message(ticket_id, "Иван П.", "текст", chat_id=CHAT_ID, message_id=9009)
+
+    assert events_of(master_uid_of(second_headers), ticket_id) == []
+    assert "message.created" in [
+        e["type"] for e in events_of(master_uid_of(headers), ticket_id)
+    ]
+
+
+def test_client_message_on_accepted_ticket_goes_to_members_only(
+    client, headers, second_headers
+):
+    """После принятия переписку видит только участник, а не вся лента."""
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(_master(headers), ticket_id)
+
+    record_client_message(ticket_id, "Иван П.", "текст", chat_id=CHAT_ID, message_id=9010)
+
+    assert "message.created" in [
+        e["type"] for e in events_of(master_uid_of(headers), ticket_id)
+    ]
+    assert "message.created" not in [
+        e["type"] for e in events_of(master_uid_of(second_headers), ticket_id)
+    ]
 
 
 def test_client_message_is_idempotent_per_update(client, headers):
@@ -193,6 +251,98 @@ def test_sync_error_does_not_break_update_handler(client, headers, monkeypatch):
 def test_source_message_id_scopes_by_chat():
     assert source_message_id(1, 2) == "tg:1:2"
     assert source_message_id(1, 2) != source_message_id(3, 2)
+
+
+# ==================== Фото клиента ====================
+
+
+def _photo(payload: bytes = b"\xff\xd8\xff\xe0fake-jpeg", name: str = "photo.jpg") -> dict:
+    return {"filename": name, "mime": "image/jpeg", "data": payload}
+
+
+def test_client_photo_lands_in_history_and_is_downloadable(client, headers):
+    """Фото клиента сохраняется, попадает в историю и отдаётся через API."""
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(_master(headers), ticket_id)
+
+    data = b"\xff\xd8\xff\xe0fake-jpeg"
+    message = record_client_message(
+        ticket_id,
+        "Иван П.",
+        "Смотрите фото",
+        chat_id=CHAT_ID,
+        message_id=9100,
+        attachments=[_photo(data)],
+    )
+
+    assert message is not None
+    assert len(message["attachments"]) == 1
+    attachment = message["attachments"][0]
+    assert attachment["source"] == "client"
+    assert attachment["kind"] == "photo"
+    assert "message.created" in [
+        e["type"] for e in events_of(master_uid_of(headers), ticket_id)
+    ]
+
+    history = client.get(f"/v1/tickets/{ticket_id}/messages", headers=headers).json()
+    assert history["messages"][-1]["attachments"][0]["attachment_id"] == attachment["attachment_id"]
+
+    download = client.get(f"/v1/attachments/{attachment['attachment_id']}", headers=headers)
+    assert download.status_code == 200
+    assert download.content == data
+    assert download.headers["content-type"].startswith("image/jpeg")
+
+
+def test_client_photo_without_caption_lands_in_history(client, headers):
+    """Фото без подписи — это тоже сообщение, просто с пустым текстом."""
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(_master(headers), ticket_id)
+
+    message = record_client_message(
+        ticket_id,
+        "Иван П.",
+        "",
+        chat_id=CHAT_ID,
+        message_id=9105,
+        attachments=[_photo()],
+    )
+
+    assert message is not None
+    assert message["text"] == ""
+    assert len(message["attachments"]) == 1
+
+
+def test_client_photo_is_idempotent_per_update(client, headers):
+    """Повторная доставка апдейта не создаёт второе сообщение и второй файл."""
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(_master(headers), ticket_id)
+
+    first = record_client_message(
+        ticket_id, "Иван П.", "фото", chat_id=CHAT_ID, message_id=9101, attachments=[_photo()]
+    )
+    second = record_client_message(
+        ticket_id, "Иван П.", "фото", chat_id=CHAT_ID, message_id=9101, attachments=[_photo()]
+    )
+
+    assert first["id"] == second["id"]
+    assert len(messages_of(ticket_id)) == 1
+    assert len(attachments_of(ticket_id)) == 1, "повтор не должен оставлять лишний файл"
+
+
+def test_client_photo_of_closed_ticket_is_discarded(client, headers):
+    """Заявка закрыта — сообщение не пишется, а сохранённый файл убирается."""
+    ticket_id = seed_ticket(client, headers)
+    master = _master(headers)
+    store.accept_ticket(master, ticket_id)
+    store.close_ticket(master, ticket_id)
+
+    message = record_client_message(
+        ticket_id, "Иван П.", "поздно", chat_id=CHAT_ID, message_id=9102, attachments=[_photo()]
+    )
+
+    assert message is None
+    assert messages_of(ticket_id) == []
+    assert attachments_of(ticket_id) == [], "непривязанный файл не должен оставаться"
 
 
 # ==================== Письмо клиента ====================

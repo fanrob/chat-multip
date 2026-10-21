@@ -10,8 +10,9 @@ Telegram, но вызовы проходят через этот модуль: �
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
+from api import attachments as attachments_service
 from api import store
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,15 @@ def record_ticket_created(ticket_id: str) -> None:
         logger.exception("Не удалось разослать ticket.created для %s", ticket_id)
 
 
+def _discard_attachments(attachment_ids: Sequence[str]) -> None:
+    """Убирает файлы, которые не удалось привязать к сообщению."""
+    for attachment_id in attachment_ids:
+        try:
+            attachments_service.delete(attachment_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось удалить неиспользованное вложение %s", attachment_id)
+
+
 def record_client_message(
     ticket_id: str,
     sender_name: str,
@@ -78,23 +88,52 @@ def record_client_message(
     *,
     chat_id: int,
     message_id: int,
+    attachments: Sequence[Dict[str, Any]] = (),
 ) -> Optional[Dict[str, Any]]:
     """Клиент написал мастеру в заявку — дописываем это в историю.
 
     Вызывается только после успешной отправки сообщения мастеру: если
     Telegram не принял сообщение, в истории клиента его быть не должно.
+
+    `attachments` — уже скачанные ботом файлы вида
+    `{"data": bytes, "filename": str, "mime": str}`. Файлы сохраняются на диск
+    и привязываются к сообщению; если запись сообщения не удалась (заявка
+    закрыта/удалена или сбой БД), только что сохранённые файлы удаляются,
+    чтобы не копить мусор.
     """
+    client_msg_id = source_message_id(chat_id, message_id)
+
+    # Повторная доставка апдейта Telegram: сообщение уже записано — не
+    # сохраняем один и тот же файл второй раз.
+    if attachments:
+        existing = store.get_source_message(client_msg_id)
+        if existing is not None:
+            return existing
+
+    saved: list[str] = []
     try:
+        for attachment in attachments:
+            meta = attachments_service.save_client_file(
+                attachment["data"],
+                attachment.get("filename") or "file",
+                attachment.get("mime") or "application/octet-stream",
+                channel="telegram",
+            )
+            saved.append(meta["attachment_id"])
+
         message = store.append_incoming_message(
             ticket_id,
             text,
             sender_name,
             channel="telegram",
-            client_msg_id=source_message_id(chat_id, message_id),
+            client_msg_id=client_msg_id,
+            attachment_ids=saved,
         )
         if message is None:
             logger.info("Заявка %s закрыта или удалена, сообщение клиента не записано", ticket_id)
+            _discard_attachments(saved)
         return message
     except Exception:
         logger.exception("Не удалось записать сообщение клиента в %s", ticket_id)
+        _discard_attachments(saved)
         return None

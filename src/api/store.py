@@ -33,6 +33,11 @@ FEED_STATUS = (STATUS_NEW,)
 #: Статусы заявок, к которым мастер имеет отношение.
 ACTIVE_STATUSES = (STATUS_NEW, STATUS_IN_PROGRESS)
 
+#: Суффикс канала доставки системных уведомлений клиенту (принятие, закрытие,
+#: переоткрытие). Уведомления идут отдельным каналом, чтобы не смешиваться с
+#: FIFO-очередью ответов мастера и не подпадать под её паузу между сообщениями.
+NOTIFY_CHANNEL_SUFFIX = "_notify"
+
 
 def _now() -> str:
     return datetime.now().isoformat()
@@ -805,6 +810,7 @@ def append_incoming_message(
     *,
     channel: str = "telegram",
     client_msg_id: Optional[str] = None,
+    attachment_ids: Sequence[str] = (),
     connection: Optional[sqlite3.Connection] = None,
 ) -> Optional[Dict[str, Any]]:
     """Дописывает в заявку сообщение, пришедшее из мессенджера.
@@ -843,12 +849,22 @@ def append_incoming_message(
         )
         conn.execute("UPDATE tickets SET updated_at = ? WHERE id = ?", (now, ticket_id))
 
+        # Привязываем присланные клиентом вложения к заявке и сообщению.
+        # Только ещё не привязанные (message_id IS NULL) — файл мастера,
+        # загруженный отдельно, чужое сообщение перехватить не должно.
+        for attachment_id in attachment_ids:
+            conn.execute(
+                "UPDATE api_attachments SET message_id = ?, ticket_id = ? "
+                "WHERE id = ? AND message_id IS NULL",
+                (message_id, ticket_id, attachment_id),
+            )
+
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
         payload = _hydrate_message(conn, row)
 
         events.emit(
             conn,
-            set(members_with_owner(conn, ticket_id)),
+            ticket_audience(conn, ticket_id),
             events.MESSAGE_CREATED,
             {"message": payload},
             ticket_id,
@@ -859,6 +875,52 @@ def append_incoming_message(
         return _work(connection)
     with transaction() as own:
         return _work(own)
+
+
+def notify_client(
+    connection: sqlite3.Connection,
+    ticket_id: str,
+    text: str,
+) -> None:
+    """Ставит клиенту системное уведомление (принятие, закрытие, переоткрытие).
+
+    Это не сообщение переписки: в `messages` оно не пишется, `seq` не занимает и
+    события мастеру не шлёт. Иначе смена статуса добавляла бы в диалог лишнюю
+    реплику и сдвигала нумерацию, а мастер и так узнаёт о ней из ticket.*.
+
+    Доставка идёт тем же механизмом `api_outbox`, но по отдельному каналу
+    (`telegram_notify` / `email_notify`): уведомление не должно вклиниваться в
+    FIFO-очередь ответов мастера. Payload помечен `system: True`, поэтому
+    консьюмер канала отправит текст как есть, без префикса «Ответ от {ФИО}».
+
+    Вызывается внутри уже открытой транзакции действия: смена статуса и
+    постановка уведомления коммитятся вместе, фантомного уведомления без
+    статуса не будет.
+    """
+    channel = ticket_channel(connection, ticket_id) + NOTIFY_CHANNEL_SUFFIX
+    connection.execute(
+        """
+        INSERT INTO api_outbox (ticket_id, message_id, channel, payload, status, created_at)
+        VALUES (?, '', ?, ?, 'pending', ?)
+        """,
+        (
+            ticket_id,
+            channel,
+            json.dumps(
+                {"ticket_id": ticket_id, "text": text, "system": True},
+                ensure_ascii=False,
+            ),
+            _now(),
+        ),
+    )
+
+
+def _closed_text(master_name: str, reason: Optional[str]) -> str:
+    """Текст уведомления клиенту о закрытии заявки (с причиной, если задана)."""
+    text = f"🔒 Ваша заявка закрыта мастером {master_name}."
+    if reason:
+        text += f"\nПричина: {reason}"
+    return text
 
 
 def new_ticket_created(ticket_id: str) -> int:
@@ -872,23 +934,16 @@ def new_ticket_created(ticket_id: str) -> int:
         if not ticket:
             return 0
 
-        masters = connection.execute(
-            "SELECT master_uid FROM api_masters WHERE is_active = 1"
-        ).fetchall()
-
-        count = 0
-        for master in masters:
-            if not is_visible(connection, ticket_id, master["master_uid"]):
-                continue
+        masters = ticket_audience(connection, ticket_id)
+        for master_uid in masters:
             events.emit(
                 connection,
-                {master["master_uid"]},
+                {master_uid},
                 events.TICKET_CREATED,
                 {"ticket_id": ticket_id},
                 ticket_id,
             )
-            count += 1
-        return count
+        return len(masters)
 
 
 # ==================== Прочтение ====================
@@ -1020,6 +1075,12 @@ def accept_ticket(
             ticket_id,
         )
 
+        notify_client(
+            connection,
+            ticket_id,
+            f"✅ Вашу заявку принял мастер {master.full_name}.",
+        )
+
     return ticket
 
 
@@ -1103,6 +1164,8 @@ def close_ticket(
             },
             ticket_id,
         )
+
+        notify_client(connection, ticket_id, _closed_text(master.full_name, reason))
     return ticket
 
 
@@ -1159,6 +1222,12 @@ def reopen_ticket(
                 "ticket": ticket,
             },
             ticket_id,
+        )
+
+        notify_client(
+            connection,
+            ticket_id,
+            f"🔄 Ваша заявка переоткрыта мастером {master.full_name}.",
         )
     return ticket
 
@@ -1315,6 +1384,28 @@ def members_with_owner(connection: sqlite3.Connection, ticket_id: str) -> List[s
     if row and row["owner_uid"]:
         uids.add(row["owner_uid"])
     return list(uids)
+
+
+def ticket_audience(connection: sqlite3.Connection, ticket_id: str) -> List[str]:
+    """Кому адресовано событие по заявке: все мастера, которым она видна.
+
+    Событие должно доходить до всей аудитории заявки, а не только до текущих
+    участников: пока заявка в ленте (new), у неё ещё нет owner и members, и
+    иначе сообщение клиента не увидит ни один мастер — приняв заявку позже,
+    он покажет только вводный текст из карточки, а вся переписка пропадёт.
+
+    Правило «кто видит заявку» уже кодирует `is_visible`: в ленте — все, кто
+    её не скрыл; в работе — только участники; закрытая — снова все. Отбираем
+    по нему, а не по статусу, чтобы не расходиться с правами доступа.
+    """
+    rows = connection.execute(
+        "SELECT master_uid FROM api_masters WHERE is_active = 1"
+    ).fetchall()
+    return [
+        row["master_uid"]
+        for row in rows
+        if is_visible(connection, ticket_id, row["master_uid"])
+    ]
 
 
 def update_profile(

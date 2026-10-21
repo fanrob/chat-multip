@@ -24,9 +24,15 @@ _RETRY_AFTER = "retry_after"
 
 
 def _format_text(payload: Dict[str, Any]) -> str:
-    """Текст для клиента по формату README: «Ответ от {ФИО}, {время}: {текст}»."""
-    author = payload.get("author") or "Мастер"
+    """Текст для клиента по формату README: «Ответ от {ФИО}, {время}: {текст}».
+
+    Системные уведомления (принятие, закрытие, переоткрытие) отправляем как
+    есть: их текст уже готов для клиента, префикс «Ответ от...» тут неуместен.
+    """
     text = payload.get("text") or ""
+    if payload.get("system"):
+        return text
+    author = payload.get("author") or "Мастер"
     stamp = datetime.now().strftime("%H:%M")
     return f"Ответ от {author}, {stamp}:\n\n{text}"
 

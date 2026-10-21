@@ -52,6 +52,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _incoming_text(message) -> str:
+    """Текст сообщения клиента: обычный текст или подпись к фото."""
+    return (message.text or message.caption or "").strip()
+
+
+async def _collect_client_attachments(context: ContextTypes.DEFAULT_TYPE, message) -> list:
+    """Скачивает присланные клиентом фото, чтобы сохранить их в заявке.
+
+    Telegram присылает фото несколькими размерами — берём последний, самый
+    крупный. Возвращает список словарей для bridge.record_client_message;
+    для сообщений без фото — пустой список.
+    """
+    photos = getattr(message, "photo", None) or []
+    if not photos:
+        return []
+    largest = photos[-1]
+    telegram_file = await context.bot.get_file(largest.file_id)
+    data = bytes(await telegram_file.download_as_bytearray())
+    return [{
+        "filename": f"photo_{largest.file_unique_id}.jpg",
+        "mime": "image/jpeg",
+        "data": data,
+    }]
+
+
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает сообщения от пользователей (не мастеров)."""
     user = update.effective_user
@@ -87,6 +112,9 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    incoming_text = _incoming_text(update.message)
+    attachments = await _collect_client_attachments(context, update.message)
+
     replied_ticket_id = None
     if update.message.reply_to_message:
         replied_ticket_id = operator_message_storage.get_ticket_id(update.message.reply_to_message.message_id)
@@ -99,16 +127,17 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
             record_client_message(
                 replied_ticket.id,
                 replied_ticket.client_name or str(user.id),
-                update.message.text,
+                incoming_text,
                 chat_id=user.id,
                 message_id=update.message.message_id,
+                attachments=attachments,
             )
             await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
             return
 
     open_ticket = ticket_storage.get_open_ticket(user.id)
 
-    if update.message.text == ALL_WORKSHOPS_BUTTON:
+    if incoming_text == ALL_WORKSHOPS_BUTTON:
         context.user_data.pop("ticket_workshop_id", None)
         await update.message.reply_text(
             "🌍 Заявка будет отправлена мастерам всех цехов. Напишите текст заявки.",
@@ -117,9 +146,9 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         return
 
     workshops = {w["name"]: w["id"] for w in workshop_storage.get_workshops()}
-    if update.message.text in workshops:
-        context.user_data["ticket_workshop_id"] = workshops[update.message.text]
-        workshop_name = update.message.text
+    if incoming_text in workshops:
+        context.user_data["ticket_workshop_id"] = workshops[incoming_text]
+        workshop_name = incoming_text
         await update.message.reply_text(
             f"🏭 Вы выбрали цех «{workshop_name}». Мастера этого цеха примут вашу заявку.\n"
             "Напишите текст заявки.",
@@ -132,9 +161,10 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         record_client_message(
             open_ticket.id,
             open_ticket.client_name or str(user.id),
-            update.message.text,
+            incoming_text,
             chat_id=user.id,
             message_id=update.message.message_id,
+            attachments=attachments,
         )
         await update.message.reply_text("✅ Ваше сообщение отправлено мастеру.")
         return
@@ -154,11 +184,22 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
         source='telegram',
         client_id=str(user.id),
         client_name=user.full_name or user.username or str(user.id),
-        text=update.message.text,
+        text=incoming_text or ("📷 Фото" if attachments else ""),
         workshop_id=workshop_id,
     )
     ticket_storage.add(ticket)
     record_ticket_created(ticket.id)
+
+    # Фото в первой заявке крепится к сообщению: только так API его отдаст.
+    if attachments:
+        record_client_message(
+            ticket.id,
+            ticket.client_name or str(user.id),
+            incoming_text,
+            chat_id=user.id,
+            message_id=update.message.message_id,
+            attachments=attachments,
+        )
 
     if workshop_id is not None:
         workshop_name = workshop_storage.get_workshop_name(workshop_id) or "выбранный цех"
@@ -166,7 +207,7 @@ async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_
             f"✅ Ваша заявка принята! Мастера цеха «{workshop_name}» скоро свяжутся с вами."
         )
     else:
-        await update.message.reply_text("✅ Ваша заявка принята! Мастера скоро свяжутся с вами.", reply_markup=close_markup)
+        await update.message.reply_text("✅ Ваша заявка принята! Мастера скоро свяжутся с вами.")
 
 
 async def process_workshop_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):

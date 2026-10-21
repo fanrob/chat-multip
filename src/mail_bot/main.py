@@ -14,7 +14,12 @@ if str(_SRC_ROOT) not in sys.path:
 
 from mail_bot import outbox as mail_outbox
 from mail_bot.mailbox import periodic_check
-from outbox_queue import CHANNEL_EMAIL, outbox_loop, recover_stale
+from outbox_queue import (
+    CHANNEL_EMAIL,
+    CHANNEL_EMAIL_NOTIFY,
+    outbox_loop,
+    recover_stale,
+)
 
 #: Свой лог: процессов теперь два, и общий файл перетирал бы им записи.
 LOG_FILE = "mail.log"
@@ -38,9 +43,13 @@ async def run():
     увидит строки, застрявшие в sending после прошлого падения, и не тронет их.
     """
     recover_stale(CHANNEL_EMAIL)
+    recover_stale(CHANNEL_EMAIL_NOTIFY)
     await asyncio.gather(
         periodic_check(),
         outbox_loop(CHANNEL_EMAIL, mail_outbox.deliver),
+        # Отдельный цикл для системных уведомлений клиенту: тот же доставщик,
+        # но свой канал, чтобы не мешать FIFO-очереди ответов мастера.
+        outbox_loop(CHANNEL_EMAIL_NOTIFY, mail_outbox.deliver),
     )
 
 

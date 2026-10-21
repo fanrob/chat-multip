@@ -184,6 +184,64 @@ def save(
     )
 
 
+def save_client_file(
+    data: bytes,
+    filename: str,
+    mime: str,
+    *,
+    channel: str = "telegram",
+) -> Dict[str, Any]:
+    """Сохраняет файл, присланный клиентом (фото из мессенджера).
+
+    Механика та же, что у `save()`: mime проверяется по белому списку, файл
+    пишется на диск, в `api_attachments` кладётся строка с `source='client'`.
+    К заявке и сообщению вложение привязывает `store.append_incoming_message`
+    в момент записи сообщения клиента — до этого оно никому не видно.
+
+    `master_uid` здесь NULL: файл клиента не принадлежит ни одному мастеру,
+    доступ к нему определяется участием в заявке (см. can_access).
+    """
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise errors.payload_too_large(len(data), MAX_ATTACHMENT_BYTES)
+
+    resolved = _check_mime(_resolve_mime(filename, mime))
+    attachment_id = new_attachment_id()
+    path = os.path.join(storage_dir(), f"{attachment_id}{_extension(resolved, filename)}")
+
+    with open(path, "wb") as target:
+        target.write(data)
+
+    now = datetime.now().isoformat()
+    stored_name = os.path.basename(filename)[:255]
+    try:
+        with transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO api_attachments
+                    (id, ticket_id, message_id, source, channel, filename, mime_type,
+                     size_bytes, storage_key, created_at, master_uid)
+                VALUES (?, NULL, NULL, 'client', ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (attachment_id, channel, stored_name, resolved, len(data), path, now),
+            )
+    except ApiError:
+        # Транзакция откатилась — файл на диске лишний.
+        _discard_file(path)
+        raise
+
+    logger.info("Клиент прислал вложение %s (%s, %d байт)", attachment_id, resolved, len(data))
+
+    return {
+        "attachment_id": attachment_id,
+        "kind": _kind(resolved),
+        "filename": stored_name,
+        "mime_type": resolved,
+        "size": len(data),
+        "source": "client",
+        "created_at": now,
+    }
+
+
 def _discard_file(path: str) -> None:
     try:
         os.remove(path)

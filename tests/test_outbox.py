@@ -9,6 +9,7 @@ Telegram не используется: подменяем бота объект
 """
 
 import asyncio
+import json
 import sqlite3
 import types
 import uuid
@@ -21,6 +22,7 @@ from api.db import reading, transaction
 from outbox_queue import (
     CHANNEL_EMAIL,
     CHANNEL_TELEGRAM,
+    CHANNEL_TELEGRAM_NOTIFY,
     DELIVERY_FAILED,
     DELIVERY_QUEUED,
     DELIVERY_SENDING,
@@ -355,6 +357,84 @@ def test_pending_peek_does_not_consume(client, headers):
     assert peek_next(CHANNEL_TELEGRAM) is not None
     assert claim_next(CHANNEL_TELEGRAM) is not None
     assert peek_next(CHANNEL_TELEGRAM) is None
+
+
+# ==================== Системные уведомления клиенту ====================
+
+
+def notify_rows(ticket_id: str) -> list:
+    """Строки очереди уведомлений клиенту (канал `*_notify`)."""
+    with reading() as connection:
+        return connection.execute(
+            "SELECT * FROM api_outbox WHERE ticket_id = ? AND channel = ? ORDER BY id",
+            (ticket_id, CHANNEL_TELEGRAM_NOTIFY),
+        ).fetchall()
+
+
+def test_accept_notifies_client_without_touching_history(client, headers):
+    """Принятие уведомляет клиента, но не добавляет сообщение в переписку."""
+    from api import store
+
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(master_of(headers), ticket_id)
+
+    with reading() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()["n"]
+    assert count == 0, "уведомления не занимают историю сообщений"
+
+    rows = notify_rows(ticket_id)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["message_id"] == "", "у уведомления нет сообщения-источника"
+    payload = json.loads(rows[0]["payload"])
+    assert payload["system"] is True
+    assert "Фёдор Семёнов" in payload["text"]
+
+
+def test_notification_is_sent_verbatim(client, headers):
+    """Уведомление уходит текстом как есть, без префикса «Ответ от…»."""
+    from api import store
+
+    ticket_id = seed_ticket(client, headers)
+    store.accept_ticket(master_of(headers), ticket_id)
+    bot = FakeBot()
+
+    assert asyncio.run(process_one(CHANNEL_TELEGRAM_NOTIFY, telegram_out(bot))) is True
+
+    kind, chat_id, text = bot.calls[0]
+    assert kind == "message"
+    assert chat_id == 12345, "клиент 12345 из seed_ticket"
+    assert text == "✅ Вашу заявку принял мастер Фёдор Семёнов."
+    assert "Ответ от" not in text
+
+
+def test_close_and_reopen_notify_client(client, headers):
+    """Закрытие и переоткрытие тоже уведомляют клиента, причина — в тексте."""
+    from api import store
+
+    ticket_id = seed_ticket(client, headers)
+    master = master_of(headers)
+    store.accept_ticket(master, ticket_id)
+    store.close_ticket(master, ticket_id, "Ремонт выполнен")
+    store.reopen_ticket(master, ticket_id)
+
+    texts = [json.loads(row["payload"])["text"] for row in notify_rows(ticket_id)]
+    assert len(texts) == 3
+    assert "принял мастер" in texts[0]
+    assert "закрыта мастером" in texts[1] and "Ремонт выполнен" in texts[1]
+    assert "переоткрыта мастером" in texts[2]
+
+
+def test_notify_channel_is_separate_from_master_replies(client, headers):
+    """Ответ мастера и уведомление не мешают друг другу в очереди."""
+    ticket_id = seed_ticket(client, headers)
+    message = queue_message(headers, ticket_id, "Подъедем в 14:00")
+
+    assert notify_rows(ticket_id)[0]["status"] == "pending", "уведомление ждёт своего цикла"
+    item = claim_next(CHANNEL_TELEGRAM)
+    assert item.message_id == message["id"], "цикл ответов забирает только ответы мастера"
 
 
 if __name__ == "__main__":  # pragma: no cover

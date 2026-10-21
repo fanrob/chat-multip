@@ -23,7 +23,12 @@ from telegram.ext import (
 )
 
 from config import BOT_TOKEN, LOG_FILE
-from outbox_queue import CHANNEL_TELEGRAM, outbox_loop, recover_stale
+from outbox_queue import (
+    CHANNEL_TELEGRAM,
+    CHANNEL_TELEGRAM_NOTIFY,
+    outbox_loop,
+    recover_stale,
+)
 from telegram_bot.bot import (
     admin_callback,
     admin_panel,
@@ -56,8 +61,15 @@ async def post_init(app: Application):
     увидит строки, застрявшие в sending после прошлого падения, и не тронет их.
     """
     recover_stale(CHANNEL_TELEGRAM)
+    recover_stale(CHANNEL_TELEGRAM_NOTIFY)
     app.create_task(
         outbox_loop(CHANNEL_TELEGRAM, partial(deliver_telegram, app.bot)), name="outbox"
+    )
+    # Отдельный цикл: системные уведомления клиенту не должны смешиваться с
+    # FIFO-очередью ответов мастера и подпадать под её паузу между сообщениями.
+    app.create_task(
+        outbox_loop(CHANNEL_TELEGRAM_NOTIFY, partial(deliver_telegram, app.bot)),
+        name="outbox-notify",
     )
 
 
@@ -71,6 +83,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r'^(adm_|disable_op_|enable_op_|transfer_admin_|del_wshop_)'))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_telegram_message))
+    # Фото клиента (в том числе с подписью): принимаем в заявку и отдаём через API.
+    app.add_handler(MessageHandler(filters.PHOTO, handle_telegram_message))
 
     app.add_handler(CallbackQueryHandler(button_callback))
 
